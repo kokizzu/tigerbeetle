@@ -14,19 +14,19 @@ TigerBeetle is designed to a higher safety standard than a general-purpose relat
 
 * Strict consistency, CRCs and crash safety are not enough.
 
-* TigerBeetle **detects and repairs disk corruption** ([3.45% per 32 months, per disk](https://research.cs.wisc.edu/wind/Publications/latent-sigmetrics07.pdf)), **detects and repairs misdirected writes** where the disk firmware writes to the wrong sector ([0.042% per 17 months, per disk](https://research.cs.wisc.edu/wind/Publications/latent-sigmetrics07.pdf)), and **prevents data tampering** with hash-chained cryptographic checksums.
+* TigerBeetle **handles and recovers from Latent Sector Errors** (e.g. at least [0.031% of SSD disks per year on average](https://www.usenix.org/system/files/fast20-maneas.pdf), and [1.4% of Enterprise HDD disks per year on average](https://www.usenix.org/legacy/events/fast08/tech/full_papers/bairavasundaram/bairavasundaram.pdf)) **detects and repairs disk corruption or misdirected I/O where firmware reads/writes the wrong sector** (e.g. at least [0.023% of SSD disks per year on average](https://www.usenix.org/system/files/fast20-maneas.pdf), and [0.466% of Nearline HDD disks per year on average](https://www.usenix.org/legacy/events/fast08/tech/full_papers/bairavasundaram/bairavasundaram.pdf)), and **detects and repairs data tampering** (on a minority of the cluster, as if it were non-Byzantine corruption) with hash-chained cryptographic checksums.
 
-* TigerBeetle **uses Direct I/O by design** to sidestep cache coherency bugs in the kernel page cache after an EIO fsync error.
+* TigerBeetle **uses Direct I/O by design** to sidestep [cache coherency bugs in the kernel page cache](https://www.usenix.org/system/files/atc20-rebello.pdf) after an EIO fsync error.
 
 * TigerBeetle **exceeds the fsync durability of a single disk** and the hardware of a single server because disk firmware can contain bugs and because single server systems fail.
 
 * TigerBeetle **provides strict serializability**, the gold standard of consistency, as a replicated state machine, and as a cluster of TigerBeetle servers (called replicas), for optimal high availability and distributed fault-tolerance.
 
-* TigerBeetle **performs synchronous replication** to a quorum of TigerBeetle servers using the pioneering [Viewstamped Replication](http://pmg.csail.mit.edu/papers/vr-revisited.pdf) and consensus protocol for low-latency automated leader election and to eliminate the risk of split-brain associated with manual failover.
+* TigerBeetle **performs synchronous replication** to a quorum of backup TigerBeetle servers using the pioneering [Viewstamped Replication](http://pmg.csail.mit.edu/papers/vr-revisited.pdf) and consensus protocol for low-latency automated leader election and to eliminate the risk of split-brain associated with ad hoc manual failover systems.
 
 * TigerBeetle is “fault-aware” and **recovers from local storage failures in the context of the global consensus protocol**, providing [more safety than replicated state machines such as ZooKeeper and LogCabin](https://www.youtube.com/watch?v=fDY6Wi0GcPs). For example, TigerBeetle can disentangle corruption in the middle of the committed journal (caused by bitrot) from torn writes at the end of the journal (caused by a power failure) to uphold durability guarantees given for committed data and maximize availability.
 
-* TigerBeetle does not depend on synchronized system clocks, does not use leader leases, and **performs leader-based timestamping** so that your application can deal only with safe relative quantities of time with respect to transfer timeouts. To ensure that the leader's clock is within safe bounds of "true time", TigerBeetle combines all the clocks in the cluster to create a fault-tolerant clock that we call ["cluster time"](https://www.tigerbeetle.com/post/three-clocks-are-better-than-one).
+* TigerBeetle does not depend on synchronized system clocks, does not use leader leases, and **performs leader-based timestamping** so that your application can deal only with safe relative quantities of time with respect to transfer timeouts. To ensure that the leader's clock is within safe bounds of "true time", TigerBeetle combines all the clocks in the cluster to create a fault-tolerant clock that we call ["cluster time"](https://tigerbeetle.com/blog/three-clocks-are-better-than-one/).
 
 ## Performance
 
@@ -111,14 +111,15 @@ Events are **immutable data structures** that **instantiate or mutate state data
                       id: 16 bytes (128-bit)
         debit_account_id: 16 bytes (128-bit)
        credit_account_id: 16 bytes (128-bit)
-               user_data: 16 bytes (128-bit) [optional, e.g. opaque third-party identifier to link this transfer (many-to-one) to an external entity]
-                reserved: 16 bytes (128-bit) [reserved, for accounting policy primitives]
+                  amount: 16 bytes (128-bit) [required, an unsigned integer in the unit of value of the debit and credit accounts, which must be the same for both accounts]
               pending_id: 16 bytes (128-bit) [optional, required to post or void an existing but pending transfer]
-                 timeout:  8 bytes ( 64-bit) [optional, required only for a pending transfer, a quantity of time, i.e. an offset in nanoseconds from timestamp]
+           user_data_128: 16 bytes (128-bit) [optional, e.g. opaque third-party identifier to link this transfer (many-to-one) to an external entity]
+            user_data_64:  8 bytes ( 64-bit) [optional, e.g. opaque third-party identifier to link this transfer (many-to-one) to an external entity]
+            user_data_32:  4 bytes ( 32-bit) [optional, e.g. opaque third-party identifier to link this transfer (many-to-one) to an external entity]
+                 timeout:  4 bytes ( 32-bit) [optional, required only for a pending transfer, a quantity of time, i.e. an offset in seconds from timestamp]
                   ledger:  4 bytes ( 32-bit) [required, to enforce isolation by ensuring that all transfers are between accounts of the same ledger]
                     code:  2 bytes ( 16-bit) [required, an opaque chart of accounts code describing the reason for the transfer, e.g. deposit, settlement]
                    flags:  2 bytes ( 16-bit) [optional, to modify the usage of the reserved field and for future feature expansion]
-                  amount:  8 bytes ( 64-bit) [required, an unsigned integer in the unit of value of the debit and credit accounts, which must be the same for both accounts]
                timestamp:  8 bytes ( 64-bit) [reserved, assigned by the leader before journalling]
 } = 128 bytes (2 CPU cache lines)
 ```
@@ -136,15 +137,17 @@ Events are **immutable data structures** that **instantiate or mutate state data
 ```
            create_account {
                       id: 16 bytes (128-bit)
-               user_data: 16 bytes (128-bit) [optional, opaque third-party identifier to link this account (many-to-one) to an external entity]
-                reserved: 48 bytes (384-bit) [reserved for future accounting policy primitives]
+          debits_pending: 16 bytes (128-bit)
+           debits_posted: 16 bytes (128-bit)
+         credits_pending: 16 bytes (128-bit)
+          credits_posted: 16 bytes (128-bit)                      
+           user_data_128: 16 bytes (128-bit) [optional, opaque third-party identifier to link this account (many-to-one) to an external entity]
+            user_data_64:  8 bytes ( 64-bit) [optional, opaque third-party identifier to link this account (many-to-one) to an external entity]
+            user_data_32:  4 bytes ( 32-bit) [optional, opaque third-party identifier to link this account (many-to-one) to an external entity]                      
+                reserved:  4 bytes ( 32-bit) [reserved for future accounting policy primitives]
                   ledger:  4 bytes ( 32-bit) [required, to enforce isolation by ensuring that all transfers are between accounts of the same ledger]
                     code:  2 bytes ( 16-bit) [required, an opaque chart of accounts code describing the reason for the transfer, e.g. deposit, settlement]
                    flags:  2 bytes ( 16-bit) [optional, net balance limits: e.g. debits_must_not_exceed_credits or credits_must_not_exceed_debits]
-          debits_pending:  8 bytes ( 64-bit)
-           debits_posted:  8 bytes ( 64-bit)
-         credits_pending:  8 bytes ( 64-bit)
-          credits_posted:  8 bytes ( 64-bit)
                timestamp:  8 bytes ( 64-bit) [reserved]
 } = 128 bytes (2 CPU cache lines)
 ```
@@ -270,7 +273,7 @@ The header is a multiple of 128 bytes because we want to keep the subsequent dat
 
 We order the header struct as we do to keep any C protocol implementations padding-free.
 
-We use BLAKE3 as our checksum, truncating the checksum to 128 bits.
+We use AEGIS-128L as our checksum, designed to fully exploit the parallelism and built-in AES support of recent Intel and ARM CPUs.
 
 The reason we use two checksums instead of only a single checksum across header and data is that we
 need a reliable way to know the size of the data to expect before we start receiving the data.
@@ -336,6 +339,10 @@ of Hours of Disk and SSD Deployments](https://www.usenix.org/system/files/confer
 * [ZFS: The Last Word in File Systems (Jeff Bonwick and Bill Moore)](https://www.youtube.com/watch?v=NRoUC9P1PmA) - On disk failure and corruption, the need for checksums... and checksums to check the checksums, and the power of copy-on-write for crash-safety.
 
 * [An Analysis of Latent Sector Errors in Disk Drives](https://research.cs.wisc.edu/wind/Publications/latent-sigmetrics07.pdf)
+
+* [An Analysis of Data Corruption in the Storage Stack](https://www.usenix.org/legacy/events/fast08/tech/full_papers/bairavasundaram/bairavasundaram.pdf)
+
+* [A Study of SSD Reliability in Large Scale Enterprise Storage Deployments](https://www.usenix.org/system/files/fast20-maneas.pdf)
 
 * [SDC 2018 - Protocol-Aware Recovery for Consensus-Based Storage](https://www.youtube.com/watch?v=fDY6Wi0GcPs) - Why replicated state machines need to distinguish between a crash and corruption, and why it would be disastrous to truncate the journal when encountering a checksum mismatch.
 

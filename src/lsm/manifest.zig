@@ -3,32 +3,34 @@ const mem = std.mem;
 const math = std.math;
 const assert = std.debug.assert;
 
+const stdx = @import("../stdx.zig");
 const constants = @import("../constants.zig");
 const growth_factor = constants.lsm_growth_factor;
 
+const vsr = @import("../vsr.zig");
 const table_count_max = @import("tree.zig").table_count_max;
 const table_count_max_for_level = @import("tree.zig").table_count_max_for_level;
 const snapshot_latest = @import("tree.zig").snapshot_latest;
+const schema = @import("schema.zig");
 
-const Direction = @import("direction.zig").Direction;
-const GridType = @import("grid.zig").GridType;
+const TreeConfig = @import("tree.zig").TreeConfig;
+const Direction = @import("../direction.zig").Direction;
+const GridType = @import("../vsr/grid.zig").GridType;
 const ManifestLogType = @import("manifest_log.zig").ManifestLogType;
 const ManifestLevelType = @import("manifest_level.zig").ManifestLevelType;
 const NodePool = @import("node_pool.zig").NodePool(constants.lsm_manifest_node_size, 16);
+const TableInfo = schema.ManifestNode.TableInfo;
 
-pub fn TableInfoType(comptime Table: type) type {
+pub fn TreeTableInfoType(comptime Table: type) type {
     const Key = Table.Key;
-    const compare_keys = Table.compare_keys;
 
-    return extern struct {
-        const TableInfo = @This();
+    return struct {
+        const TreeTableInfo = @This();
 
         /// Checksum of the table's index block.
         checksum: u128,
         /// Address of the table's index block.
         address: u64,
-        /// Unused.
-        flags: u64 = 0,
 
         /// The minimum snapshot that can see this table (with exclusive bounds).
         /// - This value is set to the current snapshot tick on table creation.
@@ -43,11 +45,9 @@ pub fn TableInfoType(comptime Table: type) type {
         key_min: Key, // Inclusive.
         key_max: Key, // Inclusive.
 
-        comptime {
-            assert(@sizeOf(TableInfo) == 48 + Table.key_size * 2);
-            assert(@alignOf(TableInfo) == 16);
-            assert(@bitSizeOf(TableInfo) == @sizeOf(TableInfo) * 8);
-        }
+        /// The number of values this table has. Tables aren't always full, so being able to know
+        /// ahead of time how many values they have helps with compaction pacing.
+        value_count: u32,
 
         /// Every query targets a particular snapshot. The snapshot determines which tables are
         /// visible to the query — i.e., which tables are accessed to answer the query.
@@ -69,7 +69,7 @@ pub fn TableInfoType(comptime Table: type) type {
         /// half-bar of compaction completes. At that point `tree.prefetch_snapshot_max` is
         /// updated (to the compaction's `compaction_op`), simultaneously rendering the old (input)
         /// tables invisible, and the new (output) tables visible.
-        pub fn visible(table: *const TableInfo, snapshot: u64) bool {
+        pub fn visible(table: *const TreeTableInfo, snapshot: u64) bool {
             assert(table.address != 0);
             assert(table.snapshot_min <= table.snapshot_max);
             assert(snapshot <= snapshot_latest);
@@ -77,7 +77,7 @@ pub fn TableInfoType(comptime Table: type) type {
             return table.snapshot_min <= snapshot and snapshot <= table.snapshot_max;
         }
 
-        pub fn invisible(table: *const TableInfo, snapshots: []const u64) bool {
+        pub fn invisible(table: *const TreeTableInfo, snapshots: []const u64) bool {
             // Return early and do not iterate all snapshots if the table was never deleted:
             if (table.visible(snapshot_latest)) return false;
             for (snapshots) |snapshot| if (table.visible(snapshot)) return false;
@@ -85,41 +85,107 @@ pub fn TableInfoType(comptime Table: type) type {
             return true;
         }
 
-        pub fn equal(table: *const TableInfo, other: *const TableInfo) bool {
-            // TODO Since the layout of TableInfo is well defined, a direct memcmp may be faster
-            // here. However, it's not clear if we can make the assumption that compare_keys()
-            // will return .eq exactly when the memory of the keys are equal.
-            // Consider defining the API to allow this.
+        pub fn equal(table: *const TreeTableInfo, other: *const TreeTableInfo) bool {
             return table.checksum == other.checksum and
                 table.address == other.address and
-                table.flags == other.flags and
                 table.snapshot_min == other.snapshot_min and
                 table.snapshot_max == other.snapshot_max and
-                compare_keys(table.key_min, other.key_min) == .eq and
-                compare_keys(table.key_max, other.key_max) == .eq;
+                table.key_min == other.key_min and
+                table.key_max == other.key_max and
+                table.value_count == other.value_count;
+        }
+
+        pub fn decode(table: *const TableInfo) TreeTableInfo {
+            assert(table.tree_id > 0);
+            assert(stdx.zeroed(&table.reserved));
+            assert(table.value_count > 0);
+
+            const key_min = std.mem.bytesAsValue(Key, table.key_min[0..@sizeOf(Key)]);
+            const key_max = std.mem.bytesAsValue(Key, table.key_max[0..@sizeOf(Key)]);
+
+            assert(key_min.* <= key_max.*);
+            assert(stdx.zeroed(table.key_min[@sizeOf(Key)..]));
+            assert(stdx.zeroed(table.key_max[@sizeOf(Key)..]));
+
+            return .{
+                .checksum = table.checksum,
+                .address = table.address,
+                .snapshot_min = table.snapshot_min,
+                .snapshot_max = table.snapshot_max,
+                .key_min = key_min.*,
+                .key_max = key_max.*,
+                .value_count = table.value_count,
+            };
+        }
+
+        pub fn encode(table: *const TreeTableInfo, options: struct {
+            tree_id: u16,
+            level: u6,
+            event: schema.ManifestNode.Event,
+        }) TableInfo {
+            assert(options.tree_id > 0);
+            assert(table.value_count > 0);
+
+            var key_min = std.mem.zeroes(TableInfo.KeyPadded);
+            var key_max = std.mem.zeroes(TableInfo.KeyPadded);
+
+            stdx.copy_disjoint(.inexact, u8, &key_min, std.mem.asBytes(&table.key_min));
+            stdx.copy_disjoint(.inexact, u8, &key_max, std.mem.asBytes(&table.key_max));
+
+            return .{
+                .checksum = table.checksum,
+                .address = table.address,
+                .snapshot_min = table.snapshot_min,
+                .snapshot_max = table.snapshot_max,
+                .tree_id = options.tree_id,
+                .key_min = key_min,
+                .key_max = key_max,
+                .value_count = table.value_count,
+                .label = .{
+                    .level = options.level,
+                    .event = options.event,
+                },
+            };
         }
     };
 }
 
 pub fn ManifestType(comptime Table: type, comptime Storage: type) type {
     const Key = Table.Key;
-    const compare_keys = Table.compare_keys;
 
     return struct {
         const Manifest = @This();
 
-        pub const TableInfo = TableInfoType(Table);
+        pub const TreeTableInfo = TreeTableInfoType(Table);
+        pub const LevelIterator = Level.Iterator;
+        pub const TableInfoReference = Level.TableInfoReference;
+        pub const KeyRange = Level.KeyRange;
+        pub const ManifestLog = ManifestLogType(Storage);
+        pub const Level =
+            ManifestLevelType(NodePool, Key, TreeTableInfo, table_count_max);
 
         const Grid = GridType(Storage);
-        const Callback = fn (*Manifest) void;
+        const Callback = *const fn (*Manifest) void;
 
-        /// Here, we use a structure with indexes over the segmented array for performance.
-        const Level = ManifestLevelType(NodePool, Key, TableInfo, compare_keys, table_count_max);
-        const KeyRange = Level.KeyRange;
+        const CompactionTableRange = struct {
+            table_a: TableInfoReference,
+            range_b: CompactionRange,
+        };
 
-        const ManifestLog = ManifestLogType(Storage, TableInfo);
+        pub const CompactionRange = struct {
+            /// The minimum key across both levels.
+            key_min: Key,
+            /// The maximum key across both levels.
+            key_max: Key,
+            // References to tables in level B that intersect with the chosen table in level A.
+            tables: stdx.BoundedArray(TableInfoReference, constants.lsm_growth_factor),
+        };
 
         node_pool: *NodePool,
+        config: TreeConfig,
+        /// manifest_log is lazily initialized rather than passed into init() because the Forest
+        /// needs it for @fieldParentPtr().
+        manifest_log: ?*ManifestLog = null,
 
         levels: [constants.lsm_levels]Level,
 
@@ -128,148 +194,206 @@ pub fn ManifestType(comptime Table: type, comptime Storage: type) type {
         // registered snapshot seen so far.
         snapshot_max: u64 = 1,
 
-        manifest_log: ManifestLog,
-
-        open_callback: ?Callback = null,
-        compact_callback: ?Callback = null,
-        checkpoint_callback: ?Callback = null,
-
-        pub fn init(
-            allocator: mem.Allocator,
-            node_pool: *NodePool,
-            grid: *Grid,
-            tree_hash: u128,
-        ) !Manifest {
+        pub fn init(allocator: mem.Allocator, node_pool: *NodePool, config: TreeConfig) !Manifest {
             var levels: [constants.lsm_levels]Level = undefined;
-            for (levels) |*level, i| {
+            for (&levels, 0..) |*level, i| {
                 errdefer for (levels[0..i]) |*l| l.deinit(allocator, node_pool);
                 level.* = try Level.init(allocator);
             }
-            errdefer for (levels) |*l| l.deinit(allocator, node_pool);
-
-            var manifest_log = try ManifestLog.init(allocator, grid, tree_hash);
-            errdefer manifest_log.deinit(allocator);
+            errdefer for (&levels) |*level| level.deinit(allocator, node_pool);
 
             return Manifest{
                 .node_pool = node_pool,
+                .config = config,
                 .levels = levels,
-                .manifest_log = manifest_log,
             };
         }
 
         pub fn deinit(manifest: *Manifest, allocator: mem.Allocator) void {
-            for (manifest.levels) |*l| l.deinit(allocator, manifest.node_pool);
-
-            manifest.manifest_log.deinit(allocator);
+            for (&manifest.levels) |*level| level.deinit(allocator, manifest.node_pool);
         }
 
-        pub fn open(manifest: *Manifest, callback: Callback) void {
-            assert(manifest.open_callback == null);
-            manifest.open_callback = callback;
+        pub fn reset(manifest: *Manifest) void {
+            for (&manifest.levels) |*level| level.reset();
 
-            manifest.manifest_log.open(manifest_log_open_event, manifest_log_open_callback);
+            manifest.* = .{
+                .node_pool = manifest.node_pool,
+                .config = manifest.config,
+                .levels = manifest.levels,
+            };
         }
 
-        fn manifest_log_open_event(
-            manifest_log: *ManifestLog,
-            level: u7,
-            table: *const TableInfo,
-        ) void {
-            const manifest = @fieldParentPtr(Manifest, "manifest_log", manifest_log);
-            assert(manifest.open_callback != null);
+        pub fn open_commence(manifest: *Manifest, manifest_log: *ManifestLog) void {
+            assert(manifest.manifest_log == null);
+            assert(!manifest_log.opened);
 
-            assert(level < constants.lsm_levels);
-            manifest.levels[level].insert_table(manifest.node_pool, table);
-        }
-
-        fn manifest_log_open_callback(manifest_log: *ManifestLog) void {
-            const manifest = @fieldParentPtr(Manifest, "manifest_log", manifest_log);
-            assert(manifest.open_callback != null);
-
-            const callback = manifest.open_callback.?;
-            manifest.open_callback = null;
-            callback(manifest);
+            manifest.manifest_log = manifest_log;
         }
 
         pub fn insert_table(
             manifest: *Manifest,
             level: u8,
-            table: *const TableInfo,
+            table: *const TreeTableInfo,
         ) void {
             const manifest_level = &manifest.levels[level];
+            if (constants.verify) {
+                assert(!manifest_level.contains(table));
+            }
+
             manifest_level.insert_table(manifest.node_pool, table);
 
-            // Append insert changes to the manifest log
-            const log_level = @intCast(u7, level);
-            manifest.manifest_log.insert(log_level, table);
+            // Append insert changes to the manifest log.
+            manifest.manifest_log.?.append(&table.encode(.{
+                .tree_id = manifest.config.id,
+                .event = .insert,
+                .level = @intCast(level),
+            }));
 
             if (constants.verify) {
                 assert(manifest_level.contains(table));
             }
         }
 
-        /// Updates the snapshot_max on the provide table for the given level.
-        /// The table provided is mutable to allow its snapshot_max to be updated.
+        /// Updates the snapshot_max on the provided table for the given level.
         pub fn update_table(
             manifest: *Manifest,
             level: u8,
             snapshot: u64,
-            table: *TableInfo,
+            table_ref: TableInfoReference,
         ) void {
+            assert(manifest.manifest_log.?.opened);
             const manifest_level = &manifest.levels[level];
 
+            var table = table_ref.table_info;
+            if (constants.verify) {
+                assert(manifest_level.contains(table));
+            }
             assert(table.snapshot_max >= snapshot);
-            manifest_level.set_snapshot_max(snapshot, table);
+            manifest_level.set_snapshot_max(snapshot, table_ref);
             assert(table.snapshot_max == snapshot);
 
-            // Append update changes to the manifest log
-            const log_level = @intCast(u7, level);
-            manifest.manifest_log.insert(log_level, table);
+            // Append update changes to the manifest log.
+            manifest.manifest_log.?.append(&table.encode(.{
+                .tree_id = manifest.config.id,
+                .event = .update,
+                .level = @intCast(level),
+            }));
+        }
+
+        pub fn move_table(
+            manifest: *Manifest,
+            level_a: u8,
+            level_b: u8,
+            table: *const TreeTableInfo,
+        ) void {
+            assert(manifest.manifest_log.?.opened);
+            assert(level_b == level_a + 1);
+            assert(level_b < constants.lsm_levels);
+            assert(table.visible(snapshot_latest));
+
+            const manifest_level_a = &manifest.levels[level_a];
+            const manifest_level_b = &manifest.levels[level_b];
+
+            if (constants.verify) {
+                assert(manifest_level_a.contains(table));
+                assert(!manifest_level_b.contains(table));
+            }
+
+            // First, remove the table from level A without appending changes to the manifest log.
+            manifest_level_a.remove_table(manifest.node_pool, table);
+
+            // Then, insert the table into level B and append these changes to the manifest log.
+            // To move a table w.r.t manifest log, a "remove" change should NOT be appended for
+            // the previous level A; When replaying the log from open(), events are processed in
+            // LIFO order and duplicates are ignored. This means the table will only be replayed in
+            // level B instead of the old one in level A.
+            manifest_level_b.insert_table(manifest.node_pool, table);
+            manifest.manifest_log.?.append(&table.encode(.{
+                .tree_id = manifest.config.id,
+                .event = .update,
+                .level = @intCast(level_b),
+            }));
+
+            if (constants.verify) {
+                assert(!manifest_level_a.contains(table));
+                assert(manifest_level_b.contains(table));
+            }
+        }
+
+        /// Returns the key range spanned by all ManifestLevels.
+        pub fn key_range(manifest: *Manifest) ?KeyRange {
+            assert(manifest.manifest_log.?.opened);
+
+            var manifest_range: ?KeyRange = null;
+            for (&manifest.levels) |*level| {
+                if (level.key_range_latest.key_range) |level_range| {
+                    if (manifest_range) |*range| {
+                        if (level_range.key_min < range.key_min) {
+                            range.key_min = level_range.key_min;
+                        }
+                        if (level_range.key_max > range.key_max) {
+                            range.key_max = level_range.key_max;
+                        }
+                    } else {
+                        manifest_range = level_range;
+                    }
+                }
+            }
+            return manifest_range;
         }
 
         pub fn remove_invisible_tables(
             manifest: *Manifest,
             level: u8,
-            snapshot: u64,
+            snapshots: []const u64,
             key_min: Key,
             key_max: Key,
         ) void {
+            assert(manifest.manifest_log.?.opened);
             assert(level < constants.lsm_levels);
-            assert(compare_keys(key_min, key_max) != .gt);
+            assert(key_min <= key_max);
 
             // Remove tables in descending order to avoid desynchronizing the iterator from
             // the ManifestLevel.
             const direction = .descending;
-            const snapshots = [_]u64{snapshot};
             const manifest_level = &manifest.levels[level];
 
             var it = manifest_level.iterator(
                 .invisible,
-                &snapshots,
+                snapshots,
                 direction,
                 KeyRange{ .key_min = key_min, .key_max = key_max },
             );
 
-            while (it.next()) |table| {
-                assert(table.invisible(&snapshots));
-                assert(compare_keys(key_min, table.key_max) != .gt);
-                assert(compare_keys(key_max, table.key_min) != .lt);
+            while (it.next()) |table_pointer| {
+                // Copy the table onto the stack: `remove_table()` doesn't allow pointers into
+                // SegmentedArray memory since it invalidates them.
+                const table: TreeTableInfo = table_pointer.*;
+                assert(table.snapshot_max < snapshot_latest);
+                assert(table.invisible(snapshots));
+                assert(key_min <= table.key_max);
+                assert(table.key_min <= key_max);
 
-                // Append remove changes to the manifest log.
-                const log_level = @intCast(u7, level);
-                manifest.manifest_log.remove(log_level, table);
-                manifest_level.remove_table(manifest.node_pool, &snapshots, table);
+                // Append remove changes to the manifest log and purge from memory (ManifestLevel):
+                manifest.manifest_log.?.append(&table.encode(.{
+                    .tree_id = manifest.config.id,
+                    .event = .remove,
+                    .level = @intCast(level),
+                }));
+                manifest_level.remove_table(manifest.node_pool, &table);
             }
 
-            if (constants.verify) manifest.assert_no_invisible_tables_at_level(level, snapshot);
+            if (constants.verify) manifest.assert_no_invisible_tables_at_level(level, snapshots);
         }
 
-        /// Returns an iterator over tables that might contain `key` (but are not guaranteed to).
-        pub fn lookup(manifest: *Manifest, snapshot: u64, key: Key) LookupIterator {
+        /// Returns an iterator over the tables visible to `snapshot` that may contain `key`
+        /// (but are not guaranteed to), across all levels > `level_min`.
+        pub fn lookup(manifest: *Manifest, snapshot: u64, key: Key, level_min: u8) LookupIterator {
             return .{
                 .manifest = manifest,
                 .snapshot = snapshot,
                 .key = key,
+                .level = level_min,
             };
         }
 
@@ -277,12 +401,13 @@ pub fn ManifestType(comptime Table: type, comptime Storage: type) type {
             manifest: *const Manifest,
             snapshot: u64,
             key: Key,
-            level: u8 = 0,
+            level: u8,
             inner: ?Level.Iterator = null,
 
-            pub fn next(it: *LookupIterator) ?*const TableInfo {
+            pub fn next(it: *LookupIterator) ?*const TreeTableInfo {
                 while (it.level < constants.lsm_levels) : (it.level += 1) {
                     const level = &it.manifest.levels[it.level];
+                    if (!level.key_range_contains(it.snapshot, it.key)) continue;
 
                     var inner = level.iterator(
                         .visible,
@@ -293,8 +418,8 @@ pub fn ManifestType(comptime Table: type, comptime Storage: type) type {
 
                     if (inner.next()) |table| {
                         assert(table.visible(it.snapshot));
-                        assert(compare_keys(it.key, table.key_min) != .lt);
-                        assert(compare_keys(it.key, table.key_max) != .gt);
+                        assert(table.key_min <= it.key);
+                        assert(it.key <= table.key_max);
                         assert(inner.next() == null);
 
                         it.level += 1;
@@ -308,90 +433,53 @@ pub fn ManifestType(comptime Table: type, comptime Storage: type) type {
         };
 
         pub fn assert_level_table_counts(manifest: *const Manifest) void {
-            for (manifest.levels) |*manifest_level, index| {
-                const level = @intCast(u8, index);
+            for (&manifest.levels, 0..) |*manifest_level, index| {
+                const level = @as(u8, @intCast(index));
                 const table_count_visible_max = table_count_max_for_level(growth_factor, level);
                 assert(manifest_level.table_count_visible <= table_count_visible_max);
             }
         }
 
-        pub fn assert_no_invisible_tables(manifest: *const Manifest, snapshot: u64) void {
-            for (manifest.levels) |_, level| {
-                manifest.assert_no_invisible_tables_at_level(@intCast(u8, level), snapshot);
+        pub fn assert_no_invisible_tables(manifest: *const Manifest, snapshots: []const u64) void {
+            for (manifest.levels, 0..) |_, level| {
+                manifest.assert_no_invisible_tables_at_level(@as(u8, @intCast(level)), snapshots);
             }
         }
 
         fn assert_no_invisible_tables_at_level(
             manifest: *const Manifest,
             level: u8,
-            snapshot: u64,
+            snapshots: []const u64,
         ) void {
-            var it = manifest.levels[level].iterator(
-                .invisible,
-                @as(*const [1]u64, &snapshot),
-                .ascending,
-                null,
-            );
+            var it = manifest.levels[level].iterator(.invisible, snapshots, .ascending, null);
             assert(it.next() == null);
         }
 
         /// Returns the next table in the range, after `key_exclusive` if provided.
         ///
         /// * The table returned is visible to `snapshot`.
-        pub fn next_table(
-            manifest: *const Manifest,
+        pub fn next_table(manifest: *const Manifest, parameters: struct {
             level: u8,
             snapshot: u64,
             key_min: Key,
             key_max: Key,
             key_exclusive: ?Key,
             direction: Direction,
-        ) ?*const TableInfo {
-            assert(level < constants.lsm_levels);
-            assert(compare_keys(key_min, key_max) != .gt);
-
-            const snapshots = [_]u64{snapshot};
-
-            if (key_exclusive == null) {
-                return manifest.levels[level].iterator(
-                    .visible,
-                    &snapshots,
-                    direction,
-                    KeyRange{ .key_min = key_min, .key_max = key_max },
-                ).next();
-            }
-
-            assert(compare_keys(key_exclusive.?, key_min) != .lt);
-            assert(compare_keys(key_exclusive.?, key_max) != .gt);
-
-            const key_min_exclusive = if (direction == .ascending) key_exclusive.? else key_min;
-            const key_max_exclusive = if (direction == .descending) key_exclusive.? else key_max;
-            assert(compare_keys(key_min_exclusive, key_max_exclusive) != .gt);
-
-            var it = manifest.levels[level].iterator(
-                .visible,
-                &snapshots,
-                direction,
-                KeyRange{ .key_min = key_min_exclusive, .key_max = key_max_exclusive },
-            );
-
-            while (it.next()) |table| {
-                assert(table.visible(snapshot));
-                assert(compare_keys(table.key_min, table.key_max) != .gt);
-                assert(compare_keys(table.key_max, key_min_exclusive) != .lt);
-                assert(compare_keys(table.key_min, key_max_exclusive) != .gt);
-
-                const next = switch (direction) {
-                    .ascending => compare_keys(table.key_min, key_exclusive.?) == .gt,
-                    .descending => compare_keys(table.key_max, key_exclusive.?) == .lt,
-                };
-                if (next) return table;
-            }
-
-            return null;
+        }) ?*const TreeTableInfo {
+            assert(parameters.level < constants.lsm_levels);
+            assert(parameters.key_min <= parameters.key_max);
+            return manifest.levels[parameters.level].next_table(.{
+                .snapshot = parameters.snapshot,
+                .key_min = parameters.key_min,
+                .key_max = parameters.key_max,
+                .key_exclusive = parameters.key_exclusive,
+                .direction = parameters.direction,
+            });
         }
 
-        /// Returns the most optimal table for compaction from a level that is due for compaction.
+        /// Returns the most optimal table from a level that is due for compaction.
+        /// The optimal compaction table is one that overlaps with the least number
+        /// of tables in the next level.
         /// Returns null if the level is not due for compaction (table_count_visible < count_max).
         pub fn compaction_table(manifest: *const Manifest, level_a: u8) ?CompactionTableRange {
             // The last level is not compacted into another.
@@ -400,115 +488,59 @@ pub fn ManifestType(comptime Table: type, comptime Storage: type) type {
             const table_count_visible_max = table_count_max_for_level(growth_factor, level_a);
             assert(table_count_visible_max > 0);
 
-            const manifest_level: *const Level = &manifest.levels[level_a];
-            if (manifest_level.table_count_visible < table_count_visible_max) return null;
+            const manifest_level_a: *const Level = &manifest.levels[level_a];
+            const manifest_level_b: *const Level = &manifest.levels[level_a + 1];
+            if (manifest_level_a.table_count_visible < table_count_visible_max) return null;
             // If even levels are compacted ahead of odd levels, then odd levels may burst.
-            assert(manifest_level.table_count_visible <= table_count_visible_max + 1);
+            assert(manifest_level_a.table_count_visible <= table_count_visible_max + 1);
 
-            var optimal: ?CompactionTableRange = null;
+            const least_overlap_table = manifest_level_a.table_with_least_overlap(
+                manifest_level_b,
+                snapshot_latest,
+                growth_factor,
+            ) orelse return null;
 
-            const snapshots = [1]u64{snapshot_latest};
-            var iterations: usize = 0;
-            var it = manifest.levels[level_a].iterator(
-                .visible,
-                &snapshots,
-                .ascending,
-                null, // All visible tables in the level therefore no KeyRange filter.
-            );
-
-            while (it.next()) |table| {
-                iterations += 1;
-
-                const range = manifest.compaction_range(level_a + 1, table.key_min, table.key_max);
-                if (optimal == null or range.table_count < optimal.?.range.table_count) {
-                    optimal = .{
-                        .table = table,
-                        .range = range,
-                    };
-                }
-                // If the table can be moved directly between levels then that is already optimal.
-                if (optimal.?.range.table_count == 1) break;
-            }
-            assert(iterations > 0);
-            assert(iterations == manifest_level.table_count_visible or
-                optimal.?.range.table_count == 1);
-
-            return optimal.?;
+            const compaction_table_range = CompactionTableRange{
+                .table_a = least_overlap_table.table,
+                .range_b = CompactionRange{
+                    .key_min = least_overlap_table.range.key_min,
+                    .key_max = least_overlap_table.range.key_max,
+                    .tables = least_overlap_table.range.tables,
+                },
+            };
+            return compaction_table_range;
         }
 
-        pub const CompactionTableRange = struct {
-            table: *const TableInfo,
-            range: CompactionRange,
-        };
-
-        pub const CompactionRange = struct {
-            /// The total number of tables in the compaction across both levels, always at least 1.
-            table_count: usize,
-            /// The minimum key across both levels.
-            key_min: Key,
-            /// The maximum key across both levels.
-            key_max: Key,
-        };
-
-        /// Returns the smallest visible range across level A and B that overlaps key_min/max.
-        ///
-        /// For example, for a table in level 2, count how many tables overlap in level 3, and
-        /// determine the span of their entire key range, which may be broader or narrower.
-        ///
-        /// The range.table_count includes the input table from level A represented by key_min/max.
-        /// Thus range.table_count=1 means that the table may be moved directly between levels.
-        ///
-        /// The range keys are guaranteed to encompass all the relevant level A and level B tables:
-        ///   range.key_min = min(a.key_min, b.key_min)
-        ///   range.key_max = max(a.key_max, b.key_max)
-        ///
-        /// This last invariant is critical to ensuring that tombstones are dropped correctly.
-        pub fn compaction_range(
+        /// Returns the smallest visible range of tables across the immutable table
+        /// and Level 0 that overlaps with the given key range: [key_min, key_max].
+        pub fn immutable_table_compaction_range(
             manifest: *const Manifest,
-            level_b: u8,
             key_min: Key,
             key_max: Key,
         ) CompactionRange {
-            assert(level_b < constants.lsm_levels);
-            assert(compare_keys(key_min, key_max) != .gt);
+            assert(key_min <= key_max);
+            const level_b = 0;
+            const manifest_level: *const Level = &manifest.levels[level_b];
 
-            var range = CompactionRange{
-                .table_count = 1,
-                .key_min = key_min,
-                .key_max = key_max,
+            // We are guaranteed to get a non-null range because Level 0 has
+            // lsm_growth_factor number of tables, so the number of tables that intersect
+            // with the immutable table can be no more than lsm_growth_factor.
+            const range = manifest_level.tables_overlapping_with_key_range(
+                key_min,
+                key_max,
+                snapshot_latest,
+                growth_factor,
+            ).?;
+
+            assert(range.key_min <= range.key_max);
+            assert(range.key_min <= key_min);
+            assert(key_max <= range.key_max);
+
+            return .{
+                .key_min = range.key_min,
+                .key_max = range.key_max,
+                .tables = range.tables,
             };
-
-            const snapshots = [_]u64{snapshot_latest};
-            var it = manifest.levels[level_b].iterator(
-                .visible,
-                &snapshots,
-                .ascending,
-                KeyRange{ .key_min = range.key_min, .key_max = range.key_max },
-            );
-
-            while (it.next()) |table| : (range.table_count += 1) {
-                assert(table.visible(snapshot_latest));
-                assert(compare_keys(table.key_min, table.key_max) != .gt);
-                assert(compare_keys(table.key_max, range.key_min) != .lt);
-                assert(compare_keys(table.key_min, range.key_max) != .gt);
-
-                // The first iterated table.key_min/max may overlap range.key_min/max entirely.
-                if (compare_keys(table.key_min, range.key_min) == .lt) {
-                    range.key_min = table.key_min;
-                }
-
-                // Thereafter, iterated tables may/may not extend the range in ascending order.
-                if (compare_keys(table.key_max, range.key_max) == .gt) {
-                    range.key_max = table.key_max;
-                }
-            }
-
-            assert(range.table_count > 0);
-            assert(compare_keys(range.key_min, range.key_max) != .gt);
-            assert(compare_keys(range.key_min, key_min) != .gt);
-            assert(compare_keys(range.key_max, key_max) != .lt);
-
-            return range;
         }
 
         /// If no subsequent levels have any overlap, then tombstones must be dropped.
@@ -518,20 +550,18 @@ pub fn ManifestType(comptime Table: type, comptime Storage: type) type {
             range: CompactionRange,
         ) bool {
             assert(level_b < constants.lsm_levels);
-            assert(range.table_count > 0);
-            assert(compare_keys(range.key_min, range.key_max) != .gt);
+            assert(range.key_min <= range.key_max);
 
             var level_c: u8 = level_b + 1;
             while (level_c < constants.lsm_levels) : (level_c += 1) {
-                const snapshots = [_]u64{snapshot_latest};
-
-                var it = manifest.levels[level_c].iterator(
-                    .visible,
-                    &snapshots,
-                    .ascending,
-                    KeyRange{ .key_min = range.key_min, .key_max = range.key_max },
-                );
-                if (it.next() == null) {
+                const manifest_level: *const Level = &manifest.levels[level_c];
+                if (manifest_level.next_table(.{
+                    .snapshot = snapshot_latest,
+                    .direction = .ascending,
+                    .key_min = range.key_min,
+                    .key_max = range.key_max,
+                    .key_exclusive = null,
+                }) != null) {
                     // If the range is being compacted into the last level then this is unreachable,
                     // as the last level has no subsequent levels and must always drop tombstones.
                     assert(level_b != constants.lsm_levels - 1);
@@ -543,47 +573,63 @@ pub fn ManifestType(comptime Table: type, comptime Storage: type) type {
             return true;
         }
 
-        pub fn reserve(manifest: *Manifest) void {
-            assert(manifest.compact_callback == null);
-            assert(manifest.checkpoint_callback == null);
+        pub fn verify(manifest: *const Manifest, snapshot: u64) void {
+            assert(snapshot <= snapshot_latest);
 
-            manifest.manifest_log.reserve();
-        }
+            switch (Table.usage) {
+                // Interior levels are non-empty.
+                .general => {
+                    var empty: bool = false;
+                    for (&manifest.levels) |*level| {
+                        var level_iterator =
+                            level.iterator(.visible, &.{snapshot}, .ascending, null);
+                        if (level_iterator.next()) |_| {
+                            assert(!empty);
+                        } else {
+                            empty = true;
+                        }
+                    }
+                },
+                // In the secondary index TableUsage, it is possible (albeit unlikely!) that every
+                // table in an interior level is deleted.
+                //
+                // Unlike general-usage tables, secondary-index tombstones need not compact down to
+                // the last level of the tree before they are deleted. (Rather, the tombstones are
+                // deleted as soon as they merge with their corresponding "put").
+                // In this way, enough object deletions may lead to compactions where the both input
+                // tables entirely cancel each other out, and no output table is written at all.
+                // See `TableUsage` for more detail.
+                .secondary_index => {},
+            }
 
-        pub fn compact(manifest: *Manifest, callback: Callback) void {
-            assert(manifest.compact_callback == null);
-            assert(manifest.checkpoint_callback == null);
-            manifest.compact_callback = callback;
+            const snapshot_from_commit = vsr.Snapshot.readable_at_commit;
+            const vsr_state = &manifest.manifest_log.?.grid.superblock.working.vsr_state;
+            for (&manifest.levels) |*level| {
+                var key_max_previous: ?Key = null;
+                var table_info_iterator = level.iterator(.visible, &.{snapshot}, .ascending, null);
+                while (table_info_iterator.next()) |table_info| {
+                    const table_snapshot = table_info.snapshot_min;
 
-            manifest.manifest_log.compact(manifest_log_compact_callback);
-        }
+                    if (key_max_previous) |key_previous| {
+                        assert(key_previous < table_info.key_min);
+                    }
+                    // We could have key_min == key_max if there is only one value.
+                    assert(table_info.key_min <= table_info.key_max);
+                    key_max_previous = table_info.key_max;
 
-        fn manifest_log_compact_callback(manifest_log: *ManifestLog) void {
-            const manifest = @fieldParentPtr(Manifest, "manifest_log", manifest_log);
-            assert(manifest.compact_callback != null);
-            assert(manifest.checkpoint_callback == null);
-
-            const callback = manifest.compact_callback.?;
-            manifest.compact_callback = null;
-            callback(manifest);
-        }
-
-        pub fn checkpoint(manifest: *Manifest, callback: Callback) void {
-            assert(manifest.compact_callback == null);
-            assert(manifest.checkpoint_callback == null);
-            manifest.checkpoint_callback = callback;
-
-            manifest.manifest_log.checkpoint(manifest_log_checkpoint_callback);
-        }
-
-        fn manifest_log_checkpoint_callback(manifest_log: *ManifestLog) void {
-            const manifest = @fieldParentPtr(Manifest, "manifest_log", manifest_log);
-            assert(manifest.compact_callback == null);
-            assert(manifest.checkpoint_callback != null);
-
-            const callback = manifest.checkpoint_callback.?;
-            manifest.checkpoint_callback = null;
-            callback(manifest);
+                    if (table_snapshot < snapshot_from_commit(vsr_state.sync_op_min) or
+                        table_snapshot > snapshot_from_commit(vsr_state.sync_op_max))
+                    {
+                        Table.verify(
+                            Storage,
+                            manifest.manifest_log.?.grid.superblock.storage,
+                            table_info.address,
+                            table_info.key_min,
+                            table_info.key_max,
+                        );
+                    }
+                }
+            }
         }
     };
 }

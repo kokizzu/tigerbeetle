@@ -3,19 +3,21 @@ const assert = std.debug.assert;
 const math = std.math;
 const mem = std.mem;
 
-const Direction = @import("direction.zig").Direction;
+const Direction = @import("../direction.zig").Direction;
 
-pub fn KWayMergeIterator(
+pub fn KWayMergeIteratorType(
     comptime Context: type,
     comptime Key: type,
     comptime Value: type,
     comptime key_from_value: fn (*const Value) callconv(.Inline) Key,
-    comptime compare_keys: fn (Key, Key) callconv(.Inline) math.Order,
     comptime k_max: u32,
     /// Peek the next key in the stream identified by stream_index.
     /// For example, peek(stream_index=2) returns user_streams[2][0].
+    /// Returns Drained if the stream was consumed and
+    /// must be refilled before calling peek() again.
+    /// Returns Empty if the stream was fully consumed and reached the end.
     comptime stream_peek: fn (
-        context: *const Context,
+        context: *Context,
         stream_index: u32,
     ) error{ Empty, Drained }!Key,
     comptime stream_pop: fn (context: *Context, stream_index: u32) Value,
@@ -86,11 +88,11 @@ pub fn KWayMergeIterator(
             return it.k == 0;
         }
 
-        pub fn pop(it: *Self) ?Value {
-            while (it.pop_internal()) |value| {
+        pub fn pop(it: *Self) error{Drained}!?Value {
+            while (try it.pop_internal()) |value| {
                 const key = key_from_value(&value);
                 if (it.previous_key_popped) |previous| {
-                    switch (compare_keys(previous, key)) {
+                    switch (std.math.order(previous, key)) {
                         .lt => assert(it.direction == .ascending),
                         // Discard this value and pop the next one.
                         .eq => continue,
@@ -104,7 +106,7 @@ pub fn KWayMergeIterator(
             return null;
         }
 
-        fn pop_internal(it: *Self) ?Value {
+        fn pop_internal(it: *Self) error{Drained}!?Value {
             if (it.k == 0) return null;
 
             // We update the heap prior to removing the value from the stream. If we updated after
@@ -114,7 +116,7 @@ pub fn KWayMergeIterator(
                 it.keys[0] = key;
                 it.down_heap();
             } else |err| switch (err) {
-                error.Drained => return null,
+                error.Drained => return error.Drained,
                 error.Empty => {
                     it.swap(0, it.k - 1);
                     it.k -= 1;
@@ -193,7 +195,7 @@ pub fn KWayMergeIterator(
         }
 
         inline fn ordered(it: Self, a: u32, b: ?u32) bool {
-            return b == null or switch (compare_keys(it.keys[a], it.keys[b.?])) {
+            return b == null or switch (std.math.order(it.keys[a], it.keys[b.?])) {
                 .lt => it.direction == .ascending,
                 .eq => stream_precedence(it.context, it.streams[a], it.streams[b.?]),
                 .gt => it.direction == .descending,
@@ -221,12 +223,8 @@ fn TestContext(comptime k_max: u32) type {
 
         streams: [k_max][]const Value,
 
-        inline fn compare_keys(a: u32, b: u32) math.Order {
-            return math.order(a, b);
-        }
-
         fn stream_peek(context: *const Self, stream_index: u32) error{ Empty, Drained }!u32 {
-            // TODO: test for Drained somehow as well
+            // TODO: test for Drained somehow as well.
             const stream = context.streams[stream_index];
             if (stream.len == 0) return error.Empty;
             return stream[0].key;
@@ -241,7 +239,7 @@ fn TestContext(comptime k_max: u32) type {
         fn stream_precedence(context: *const Self, a: u32, b: u32) bool {
             _ = context;
 
-            // Higher streams have higher precedence
+            // Higher streams have higher precedence.
             return a > b;
         }
 
@@ -250,12 +248,11 @@ fn TestContext(comptime k_max: u32) type {
             streams_keys: []const []const u32,
             expect: []const Value,
         ) !void {
-            const KWay = KWayMergeIterator(
+            const KWay = KWayMergeIteratorType(
                 Self,
                 u32,
                 Value,
                 Value.to_key,
-                compare_keys,
                 k_max,
                 stream_peek,
                 stream_pop,
@@ -266,22 +263,22 @@ fn TestContext(comptime k_max: u32) type {
 
             var streams: [k_max][]Value = undefined;
 
-            for (streams_keys) |stream_keys, i| {
+            for (streams_keys, 0..) |stream_keys, i| {
                 errdefer for (streams[0..i]) |s| testing.allocator.free(s);
                 streams[i] = try testing.allocator.alloc(Value, stream_keys.len);
-                for (stream_keys) |key, j| {
+                for (stream_keys, 0..) |key, j| {
                     streams[i][j] = .{
                         .key = key,
-                        .version = @intCast(u32, i),
+                        .version = @as(u32, @intCast(i)),
                     };
                 }
             }
             defer for (streams[0..streams_keys.len]) |s| testing.allocator.free(s);
 
             var context: Self = .{ .streams = streams };
-            var kway = KWay.init(&context, @intCast(u32, streams_keys.len), direction);
+            var kway = KWay.init(&context, @as(u32, @intCast(streams_keys.len)), direction);
 
-            while (kway.pop()) |value| {
+            while (try kway.pop()) |value| {
                 try actual.append(value);
             }
 
@@ -319,17 +316,17 @@ fn TestContext(comptime k_max: u32) type {
                 }
 
                 var expect_buffer_len: usize = 0;
-                for (streams[0..k]) |stream, version| {
+                for (streams[0..k], 0..) |stream, version| {
                     for (stream) |key| {
                         expect_buffer[expect_buffer_len] = .{
                             .key = key,
-                            .version = @intCast(u32, version),
+                            .version = @as(u32, @intCast(version)),
                         };
                         expect_buffer_len += 1;
                     }
                 }
                 const expect_with_duplicates = expect_buffer[0..expect_buffer_len];
-                std.sort.sort(Value, expect_with_duplicates, {}, value_less_than);
+                std.mem.sort(Value, expect_with_duplicates, {}, value_less_than);
 
                 var target: usize = 0;
                 var previous_key: ?u32 = null;
@@ -372,14 +369,14 @@ fn TestContext(comptime k_max: u32) type {
             const key_max = random.intRangeLessThanBiased(u32, 512, 1024);
             switch (random.uintLessThanBiased(u8, 100)) {
                 0...4 => {
-                    mem.set(u32, stream, random.int(u32));
+                    @memset(stream, random.int(u32));
                 },
                 else => {
                     random.bytes(mem.sliceAsBytes(stream));
                 },
             }
             for (stream) |*key| key.* = key.* % key_max;
-            std.sort.sort(u32, stream, {}, key_less_than);
+            std.mem.sort(u32, stream, {}, key_less_than);
         }
 
         fn key_less_than(_: void, a: u32, b: u32) bool {

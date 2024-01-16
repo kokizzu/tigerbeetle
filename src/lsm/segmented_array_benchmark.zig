@@ -79,7 +79,7 @@ pub fn main() !void {
             NodePool,
             // Must be max of both to avoid hitting SegmentedArray's assertion:
             //   assert(element_count_max > node_capacity);
-            comptime std.math.max(
+            comptime @max(
                 options.value_count,
                 @divFloor(options.node_size, @sizeOf(Key)) + 1,
             ),
@@ -89,11 +89,6 @@ pub fn main() !void {
                     return value.key;
                 }
             }.key_from_value,
-            struct {
-                inline fn compare_keys(a: Key, b: Key) std.math.Order {
-                    return std.math.order(a, b);
-                }
-            }.compare_keys,
             .{ .verify = false },
         );
 
@@ -118,8 +113,8 @@ pub fn main() !void {
         const queries = try alloc_shuffled_index(allocator, options.value_count, prng.random());
         defer allocator.free(queries);
 
-        const timer = try std.time.Timer.start();
-        const repetitions = std.math.max(1, @divFloor(samples, queries.len));
+        var timer = try std.time.Timer.start();
+        const repetitions = @max(1, @divFloor(samples, queries.len));
         var j: usize = 0;
         while (j < repetitions) : (j += 1) {
             for (queries) |query| {
@@ -142,7 +137,7 @@ pub fn main() !void {
 fn alloc_shuffled_index(allocator: std.mem.Allocator, n: usize, rand: std.rand.Random) ![]usize {
     // Allocate on the heap; the array may be too large to fit on the stack.
     var indices = try allocator.alloc(usize, n);
-    for (indices) |*i, j| i.* = j;
+    for (indices, 0..) |*i, j| i.* = j;
     rand.shuffle(usize, indices[0..]);
     return indices;
 }

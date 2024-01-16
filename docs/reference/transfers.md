@@ -14,7 +14,6 @@ the latter term is heavily overloaded in the context of databases.
 
 Transfers *cannot be modified* after creation.
 
-
 ## Modes
 
 Fields used by each mode of transfer:
@@ -24,9 +23,11 @@ Fields used by each mode of transfer:
 | `id`                          | required     | required | required     | required     |
 | `debit_account_id`            | required     | required | optional     | optional     |
 | `credit_account_id`           | required     | required | optional     | optional     |
-| `user_data`                   | optional     | optional | optional     | optional     |
-| `reserved`                    | none         | none     | none         | none         |
+| `amount`                      | required     | required | optional     | optional     |
 | `pending_id`                  | none         | none     | required     | required     |
+| `user_data_128`               | optional     | optional | optional     | optional     |
+| `user_data_64`                | optional     | optional | optional     | optional     |
+| `user_data_32`                | optional     | optional | optional     | optional     |
 | `timeout`                     | none         | optional | none         | none         |
 | `ledger`                      | required     | required | optional     | optional     |
 | `code`                        | required     | required | optional     | optional     |
@@ -34,53 +35,40 @@ Fields used by each mode of transfer:
 | `flags.pending`               | false        | true     | false        | false        |
 | `flags.post_pending_transfer` | false        | false    | true         | false        |
 | `flags.void_pending_transfer` | false        | false    | false        | true         |
-| `amount`                      | required     | required | optional     | optional     |
+| `flags.balancing_debit`       | optional     | optional | false        | false        |
+| `flags.balancing_credit`      | optional     | optional | false        | false        |
+| `timestamp`                   | none         | none     | none         | none         |
 
 TigerBeetle uses the same data structures internally and
 externally. This means that sometimes you need to set temporary values
 for fields that TigerBeetle, not you (the user), are responsible.
 
-### Single-Phase Transfer
+### Single-phase transfer
 
 Single-phase transfers post funds to accounts immediately when they are created.
 
-### Two-Phase Transfer
+### Two-phase transfer
 
 A pending transfer followed by a post-pending transfer, void-pending transfer, or a timeout is
 called a "two-phase transfer". Unlike a single-phase transfer, a two-phase transfer moves funds in
 stages:
 
-1. [Reserve funds](#pending-transfer).
-2. Resolve funds (post, void, or timeout).
+1. Reserve funds
+2. Resolve funds (post, void, or timeout)
 
-Pending amounts (the pending transfer's [`amount`](#amount)) cannot be spent by either the payer or
-payee until the pending transfer is _resolved_ — that is, until the first of the following events
-occur:
-
-* If a corresponding [`post_pending_transfer`](#post-pending-transfer) is
-  committed, some or all of the pending transfer's reserved funds are
-  posted, and the remainder (if any) is restored to the original
-  accounts.
-* If a corresponding [`void_pending_transfer`](#void-pending-transfer) is
-  committed, the pending transfer's reserved funds are restored to
-  their original accounts.
-* If the pending transfer has a timeout and the timeout expires, the pending
-  transfer's reserved funds are restored to their original accounts.
-
-A pending transfer resolves at most once.
 Attempting to resolve a pending transfer more than once will return the applicable error result:
-- [`pending_transfer_already_posted`](./operations/create_transfers.md#pending_transfer_already_posted)
-- [`pending_transfer_already_voided`](./operations/create_transfers.md#pending_transfer_already_voided)
-- [`pending_transfer_expired`](./operations/create_transfers.md#pending_transfer_expired)
+- [`pending_transfer_already_posted`](../reference/operations/create_transfers.md#pending_transfer_already_posted)
+- [`pending_transfer_already_voided`](../reference/operations/create_transfers.md#pending_transfer_already_voided)
+- [`pending_transfer_expired`](../reference/operations/create_transfers.md#pending_transfer_expired)
 
-#### Pending Transfer
+#### Pending transfer
 
 A pending transfer, denoted by [`flags.pending`](#flagspending),
 reserves its `amount` in the debit/credit accounts'
 [`debits_pending`](./accounts.md#debits_pending)/[`credits_pending`](./accounts.md#credits_pending)
 fields respectively, leaving `debits_posted`/`credits_posted` unmodified.
 
-#### Post-Pending Transfer
+#### Post-pending transfer
 
 A post-pending transfer, denoted by [`flags.post_pending_transfer`](#flagspost_pending_transfer),
 causes the corresponding pending transfer (referenced by [`pending_id`](#pending_id)) to "post",
@@ -106,34 +94,11 @@ value of the pending transfer's field:
 * `ledger`
 * `code`
 
-##### Examples
-
-###### Post Full Pending Amount
-
-| Account `A` |            | Account `B`   |            | Transfers |        |            |                         |
-| ----------: | ---------: | ------------: | ---------: | :-------- | :----- | ---------: | :---------------------- |
-| **debits**  |            |   **credits** |            |           |        |            |                         |
-| **pending** | **posted** |   **pending** | **posted** | **DR**    | **CR** | **amount** | **flags**               |
-|         `w` |        `x` |           `y` |        `z` | -         | -      |          - | -                       |
-|   123 + `w` |        `x` |     123 + `y` |        `z` | `A`       | `B`    |        123 | `pending`               |
-|         `w` |  123 + `x` |           `y` |  123 + `z` | `A`       | `B`    |        123 | `post_pending_transfer` |
-
-###### Post Partial Pending Amount
-
-| Account `A` |            | Account `B`   |            | Transfers |        |            |                         |
-| ----------: | ---------: | ------------: | ---------: | :-------- | :----- | ---------: | :---------------------- |
-| **debits**  |            |   **credits** |            |           |        |            |                         |
-| **pending** | **posted** |   **pending** | **posted** | **DR**    | **CR** | **amount** | **flags**               |
-|         `w` |        `x` |           `y` |        `z` | -         | -      |          - | -                       |
-|   123 + `w` |        `x` |     123 + `y` |        `z` | `A`       | `B`    |        123 | `pending`               |
-|         `w` |  100 + `x` |           `y` |  100 + `z` | `A`       | `B`    |        100 | `post_pending_transfer` |
-
-#### Void-Pending Transfer
+#### Void-pending transfer
 
 A void-pending transfer, denoted by [`flags.void_pending_transfer`](#flagsvoid_pending_transfer),
 causes the pending transfer (referenced by [`pending_id`](#pending_id)) to void. The pending amount
 is restored to its original accounts.
-
 Additionally, when this field is set:
 
 * `pending_id` must reference a [pending transfer](#pending-transfer).
@@ -144,20 +109,14 @@ value of the pending transfer's field:
 
 * `debit_account_id`
 * `credit_account_id`
+* `amount`
 * `ledger`
 * `code`
-* `amount`
 
-###### Example
+#### Read more
 
-| Account `A` |            | Account `B`   |            | Transfers |        |            |                         |
-| ----------: | ---------: | ------------: | ---------: | :-------- | :----- | ---------: | :---------------------- |
-| **debits**  |            |   **credits** |            |           |        |            |                         |
-| **pending** | **posted** |   **pending** | **posted** | **DR**    | **CR** | **amount** | **flags**               |
-|         `w` |        `x` |           `y` |        `z` | -         | -      |          - | -                       |
-|   123 + `w` |        `x` |     123 + `y` |        `z` | `A`       | `B`    |        123 | `pending`               |
-|         `w` |        `x` |           `y` |        `z` | `A`       | `B`    |        123 | `void_pending_transfer` |
-
+See the [Two-phase transfers](../design/two-phase-transfers.md) guide
+for details, examples, and sample code.
 
 ## Fields
 
@@ -165,7 +124,7 @@ value of the pending transfer's field:
 
 This is a unique identifier for the transaction.
 
-As an example, you might generate a [random id](../usage/data-modeling.md#random-identifer) to
+As an example, you might generate a [ULID](../design/data-modeling.md#time-based-identifiers) to
 identify each transaction.
 
 Constraints:
@@ -206,28 +165,39 @@ Constraints:
   - If `credit_account_id` is nonzero, it must match the corresponding pending transfer's
     `credit_account_id`.
 
-### `user_data`
+### `amount`
 
-This is an optional secondary identifier to link this transfer to an
-external entity.
+This is how much should be debited from the `debit_account_id` account
+and credited to the `credit_account_id` account.
 
-As an example, you might use a [random id](../usage/data-modeling.md#random-identifer) that ties
-together a group of transfers.
-
-For more information, see [Data Modeling](../usage/data-modeling.md#user_data).
-
-Constraints:
-
-* Type is 128-bit unsigned integer (16 bytes)
-
-### `reserved`
-
-This space may be used for additional data in the future.
+- When `flags.balancing_debit` is set, this is the maximum amount that will be debited/credited,
+  where the actual transfer amount is determined by the debit account's constraints.
+- When `flags.balancing_credit` is set, this is the maximum amount that will be debited/credited,
+  where the actual transfer amount is determined by the credit account's constraints.
 
 Constraints:
 
 * Type is 128-bit unsigned integer (16 bytes)
-* Must be zero
+* When `flags.post_pending_transfer` is set:
+  * If `amount` is zero, it will be automatically be set to the pending transfer's `amount`.
+  * If `amount` is nonzero, it must be less than or equal to the pending transfer's `amount`.
+* When `flags.void_pending_transfer` is set:
+  * If `amount` is zero, it will be automatically be set to the pending transfer's `amount`.
+  * If `amount` is nonzero, it must be equal to the pending transfer's `amount`.
+* When `flags.balancing_debit` and/or `flags.balancing_credit` is set, if `amount` is zero,
+  it will automatically be set to the maximum amount that does not violate the corresponding
+  account limits. (Equivalent to setting `amount = 2^128 - 1`).
+* When all of the following flags are not set, `amount` must be nonzero:
+  * `flags.post_pending_transfer`
+  * `flags.void_pending_transfer`
+  * `flags.balancing_debit`
+  * `flags.balancing_credit`
+
+#### Examples
+
+- For representing fractional amounts (e.g. `$12.34`), see
+  [Fractional Amounts](../recipes/fractional-amounts.md).
+- For balancing transfers, see [Close Account](../recipes/close-account.md).
 
 ### `pending_id`
 
@@ -246,9 +216,49 @@ Constraints:
 * Must be zero if neither void nor pending transfer flag is set
 * Must match an existing transfer's [`id`](#id) if non-zero
 
+### `user_data_128`
+
+This is an optional 128-bit secondary identifier to link this transfer to an
+external entity or event.
+
+As an example, you might use a [ULID](../design/data-modeling.md#time-based-identifiers)
+that ties together a group of transfers.
+
+For more information, see [Data Modeling](../design/data-modeling.md#user_data).
+
+Constraints:
+
+* Type is 128-bit unsigned integer (16 bytes)
+
+### `user_data_64`
+
+This is an optional 64-bit secondary identifier to link this transfer to an
+external entity or event.
+
+As an example, you might use this field store an external timestamp.
+
+For more information, see [Data Modeling](../design/data-modeling.md#user_data).
+
+Constraints:
+
+* Type is 64-bit unsigned integer (8 bytes)
+
+### `user_data_32`
+
+This is an optional 32-bit secondary identifier to link this transfer to an
+external entity or event.
+
+As an example, you might use this field to store a timezone or locale.
+
+For more information, see [Data Modeling](../design/data-modeling.md#user_data).
+
+Constraints:
+
+* Type is 32-bit unsigned integer (4 bytes)
+
 ### `timeout`
 
-This is the interval (in nanoseconds) after a
+This is the interval in seconds after a
 [`pending`](#flagspending) transfer's [arrival at the cluster](#timestamp)
 that it may be posted or voided. Zero denotes absence of timeout.
 
@@ -259,10 +269,8 @@ Non-pending transfers cannot have a timeout.
 
 Constraints:
 
-* Type is 64-bit unsigned integer (8 bytes)
+* Type is 32-bit unsigned integer (4 bytes)
 * Must be zero if `flags.pending` is *not* set
-* Must not overflow a 64-bit unsigned integer when summed with the transfer's timestamp
-  (`error.overflows_timeout`)
 
 ### `ledger`
 
@@ -307,6 +315,8 @@ This specifies (optional) transfer behavior.
 Constraints:
 
 * Type is 16-bit unsigned integer (2 bytes)
+* Some flags are mutually exclusive; see
+  [`flags_are_mutually_exclusive`](./operations/create_transfers.md#flags_are_mutually_exclusive).
 
 #### `flags.linked`
 
@@ -346,7 +356,7 @@ and each other.
 
 After the link has executed, the association of each event is lost.
 To save the association, it must be
-[encoded into the data model](../usage/data-modeling.md).
+[encoded into the data model](../design/data-modeling.md).
 
 ##### Examples
 
@@ -364,27 +374,55 @@ Mark the transfer as a [post-pending transfer](#post-pending-transfer).
 
 Mark the transfer as a [void-pending transfer](#void-pending-transfer).
 
-### `amount`
+#### `flags.balancing_debit`
 
-This is how much should be debited from the `debit_account_id` account
-and credited to the `credit_account_id` account.
+Transfer at most [`amount`](#amount) — automatically transferring less than `amount` as necessary
+such that `debit_account.debits_pending + debit_account.debits_posted ≤ debit_account.credits_posted`.
+If `amount` is set to `0`, transfer at most `2^64 - 1` (i.e. as much as possible).
 
-Constraints:
+If the highest amount transferable is `0`, returns
+[`exceeds_credits`](./operations/create_transfers.md#exceeds_credits).
 
-* Type is 64-bit unsigned integer (8 bytes)
-* When `flags.post_pending_transfer` is set:
-  * If `amount` is zero, it will be automatically be set to the pending transfer's `amount`.
-  * If `amount` is nonzero, it must be less than or equal to the pending transfer's `amount`.
-* When `flags.void_pending_transfer` is set:
-  * If `amount` is zero, it will be automatically be set to the pending transfer's `amount`.
-  * If `amount` is nonzero, it must be equal to the pending transfer's `amount`.
-* When `flags.post_pending_transfer` and `flags.void_pending_transfer` are not set, `amount` must
-  not be zero.
+Retrying a balancing transfer will return
+[`exists_with_different_amount`](./operations/create_transfers.md#exists_with_different_amount)
+if the amount of the retry differs from the amount that was actually transferred.
 
-#### Examples
+The `amount` of the recorded transfer is set to the actual amount that was transferred, which is
+less than or equal to the amount that was passed to `create_transfers`.
 
-- For representing fractional amounts (e.g. `$12.34`), see
-  [Fractional Amounts](../recipes/fractional-amounts.md).
+`flags.balancing_debit` is exclusive with the `flags.post_pending_transfer`/`flags.void_pending_transfer`
+flags because posting or voiding a pending transfer will never exceed/overflow either account's limits.
+
+`flags.balancing_debit` is compatible with (and orthogonal to) `flags.balancing_credit`.
+
+##### Examples
+
+- [Close Account](../recipes/close-account.md)
+
+#### `flags.balancing_credit`
+
+Transfer at most [`amount`](#amount) — automatically transferring less than `amount` as necessary
+such that `credit_account.credits_pending + credit_account.credits_posted ≤ credit_account.debits_posted`.
+If `amount` is set to `0`, transfer at most `2^64 - 1` (i.e. as much as possible).
+
+If the highest amount transferable is `0`, returns
+[`exceeds_debits`](./operations/create_transfers.md#exceeds_debits).
+
+Retrying a balancing transfer will return
+[`exists_with_different_amount`](./operations/create_transfers.md#exists_with_different_amount)
+if the amount of the retry differs from the amount that was actually transferred.
+
+The `amount` of the recorded transfer is set to the actual amount that was transferred, which is
+less than or equal to the amount that was passed to `create_transfers`.
+
+`flags.balancing_credit` is exclusive with the `flags.post_pending_transfer`/`flags.void_pending_transfer`
+flags because posting or voiding a pending transfer will never exceed/overflow either account's limits.
+
+`flags.balancing_credit` is compatible with (and orthogonal to) `flags.balancing_debit`.
+
+##### Examples
+
+- [Close Account](../recipes/close-account.md)
 
 ### `timestamp`
 
@@ -410,9 +448,9 @@ Constraints:
 
 If you're curious and want to learn more, you can find the source code
 for this struct in
-[src/tigerbeetle.zig](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/tigerbeetle.zig). Search
+[src/tigerbeetle.zig](https://github.com/tigerbeetle/tigerbeetle/blob/main/src/tigerbeetle.zig). Search
 for `const Transfer = extern struct {`.
 
 You can find the source code for creating a transfer in
-[src/state_machine.zig](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/state_machine.zig). Search
+[src/state_machine.zig](https://github.com/tigerbeetle/tigerbeetle/blob/main/src/state_machine.zig). Search
 for `fn create_transfer(`.

@@ -26,11 +26,10 @@ const tb = @import("../tigerbeetle.zig");
 const vsr = @import("../vsr.zig");
 const accounting_auditor = @import("auditor.zig");
 const Auditor = accounting_auditor.AccountingAuditor;
-const IdPermutation = @import("../test/id.zig").IdPermutation;
-const fuzz = @import("../test/fuzz.zig");
+const IdPermutation = @import("../testing/id.zig").IdPermutation;
+const fuzz = @import("../testing/fuzz.zig");
 
-// TODO(zig) This won't be necessary in Zig 0.10.
-const PriorityQueue = @import("../test/priority_queue.zig").PriorityQueue;
+const PriorityQueue = std.PriorityQueue;
 
 const TransferOutcome = enum {
     /// The transfer is guaranteed to commit.
@@ -99,10 +98,12 @@ const TransferBatch = struct {
 
 /// Indexes: [valid:bool][limit:bool][method]
 const transfer_templates = table: {
-    const SNGL = @enumToInt(TransferPlan.Method.single_phase);
-    const PEND = @enumToInt(TransferPlan.Method.pending);
-    const POST = @enumToInt(TransferPlan.Method.post_pending);
-    const VOID = @enumToInt(TransferPlan.Method.void_pending);
+    @setEvalBranchQuota(2000);
+
+    const SNGL = @intFromEnum(TransferPlan.Method.single_phase);
+    const PEND = @intFromEnum(TransferPlan.Method.pending);
+    const POST = @intFromEnum(TransferPlan.Method.post_pending);
+    const VOID = @intFromEnum(TransferPlan.Method.void_pending);
     const Result = accounting_auditor.CreateTransferResultSet;
     const result = Result.init;
 
@@ -165,12 +166,27 @@ const transfer_templates = table: {
 pub fn WorkloadType(comptime AccountingStateMachine: type) type {
     const Operation = AccountingStateMachine.Operation;
 
-    const Action = enum(u8) {
-        create_accounts = @enumToInt(Operation.create_accounts),
-        create_transfers = @enumToInt(Operation.create_transfers),
-        lookup_accounts = @enumToInt(Operation.lookup_accounts),
-        lookup_transfers = @enumToInt(Operation.lookup_transfers),
-    };
+    // Create the enum using @Type reification. Previously, we were using enumToInt for the variant
+    // value (see below), but it was crashing the stage2 compiler (0.10.1) so we use @Type instead.
+    // ```
+    // const Action = enum(u8) {
+    //     create_accounts = @enumToInt(Operation.create_accounts), // An enum with one is fine.
+    //     create_transfers = @enumToInt(Operation.create_transfers), // But 2+ crashes stage2.
+    // };
+    // ```
+    const Action = @Type(.{
+        .Enum = .{
+            .tag_type = u8,
+            .fields = &[_]std.builtin.Type.EnumField{
+                .{ .name = "create_accounts", .value = @intFromEnum(Operation.create_accounts) },
+                .{ .name = "create_transfers", .value = @intFromEnum(Operation.create_transfers) },
+                .{ .name = "lookup_accounts", .value = @intFromEnum(Operation.lookup_accounts) },
+                .{ .name = "lookup_transfers", .value = @intFromEnum(Operation.lookup_transfers) },
+            },
+            .decls = &.{},
+            .is_exhaustive = true,
+        },
+    });
 
     return struct {
         const Self = @This();
@@ -230,7 +246,7 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
                 options.auditor_options.client_count * constants.client_request_queue_max,
             );
 
-            for (auditor.accounts) |*account, i| {
+            for (auditor.accounts, 0..) |*account, i| {
                 account.* = std.mem.zeroInit(tb.Account, .{
                     .id = auditor.account_index_to_id(i),
                     .ledger = 1,
@@ -303,7 +319,7 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
             assert(size <= body.len);
 
             return .{
-                .operation = @intToEnum(Operation, @enumToInt(action)),
+                .operation = @as(Operation, @enumFromInt(@intFromEnum(action))),
                 .size = size,
             };
         }
@@ -312,7 +328,7 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
         pub fn on_reply(
             self: *Self,
             client_index: usize,
-            operation: vsr.Operation,
+            operation: AccountingStateMachine.Operation,
             timestamp: u64,
             request_body: []align(@alignOf(vsr.Header)) const u8,
             reply_body: []align(@alignOf(vsr.Header)) const u8,
@@ -321,7 +337,7 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
             assert(request_body.len <= constants.message_size_max - @sizeOf(vsr.Header));
             assert(reply_body.len <= constants.message_size_max - @sizeOf(vsr.Header));
 
-            switch (operation.cast(AccountingStateMachine)) {
+            switch (operation) {
                 .create_accounts => self.auditor.on_create_accounts(
                     client_index,
                     timestamp,
@@ -346,13 +362,14 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
                     std.mem.bytesAsSlice(u128, request_body),
                     std.mem.bytesAsSlice(tb.Transfer, reply_body),
                 ),
-                else => unreachable,
+                //TODO: implement query.
+                .get_account_transfers => unreachable,
             }
         }
 
         fn build_create_accounts(self: *Self, client_index: usize, accounts: []tb.Account) usize {
             const results = self.auditor.expect_create_accounts(client_index);
-            for (accounts) |*account, i| {
+            for (accounts, 0..) |*account, i| {
                 const account_index = self.random.uintLessThanBiased(usize, self.auditor.accounts.len);
                 account.* = self.auditor.accounts[account_index];
                 account.debits_pending = 0;
@@ -408,15 +425,20 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
                     {
                         // Convert the previous transfer to a single-phase no-limit transfer, but
                         // link it to the current transfer — it will still fail.
-                        _ = self.build_transfer(transfers[i - 1].id, .{
+                        const result_set_opt = self.build_transfer(transfers[i - 1].id, .{
                             .valid = true,
                             .limit = false,
                             .method = .single_phase,
                         }, &transfers[i - 1]);
-                        transfers[i - 1].flags.linked = true;
-                        results[i - 1] = accounting_auditor.CreateTransferResultSet.init(.{
-                            .linked_event_failed = true,
-                        });
+                        if (result_set_opt) |result_set| {
+                            assert(result_set.count() == 1);
+                            assert(result_set.contains(.ok));
+
+                            transfers[i - 1].flags.linked = true;
+                            results[i - 1] = accounting_auditor.CreateTransferResultSet.init(.{
+                                .linked_event_failed = true,
+                            });
+                        }
                     }
                 }
                 assert(results[i].count() > 0);
@@ -429,7 +451,7 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
             // Checksum transfers only after the whole batch is ready.
             // The opportunistic linking backtracks to modify transfers.
             for (transfers[0..transfers_count]) |*transfer| {
-                transfer.user_data = vsr.checksum(std.mem.asBytes(transfer));
+                transfer.user_data_128 = vsr.checksum(std.mem.asBytes(transfer));
             }
             assert(transfers_count == i);
             assert(transfers_count <= transfers.len);
@@ -464,7 +486,7 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
             };
 
             // +1 to make the span-max inclusive.
-            const lookup_window_size = std.math.min(
+            const lookup_window_size = @min(
                 fuzz.random_int_exponential(
                     self.random,
                     usize,
@@ -513,9 +535,9 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
                 break :method default;
             };
 
-            const index_valid = @boolToInt(transfer_plan.valid);
-            const index_limit = @boolToInt(transfer_plan.limit);
-            const index_method = @enumToInt(method);
+            const index_valid = @intFromBool(transfer_plan.valid);
+            const index_limit = @intFromBool(transfer_plan.limit);
+            const index_method = @intFromEnum(method);
             const transfer_template = &transfer_templates[index_valid][index_limit][index_method];
 
             const limit_debits = transfer_plan.limit and self.random.boolean();
@@ -538,16 +560,17 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
                 .id = transfer_id,
                 .debit_account_id = debit_account.id,
                 .credit_account_id = credit_account.id,
-                // "user_data" will be set to a checksum of the Transfer.
-                .user_data = 0,
-                .reserved = 0,
+                // "user_data_128" will be set to a checksum of the Transfer.
+                .user_data_128 = 0,
+                .user_data_64 = 0,
+                .user_data_32 = 0,
                 .pending_id = 0,
                 .timeout = 0,
                 .ledger = transfer_template.ledger,
                 .code = 123,
                 .flags = .{},
                 // +1 to avoid `.amount_must_not_be_zero`.
-                .amount = 1 + @as(u64, self.random.int(u8)),
+                .amount = 1 + @as(u128, self.random.int(u8)),
             };
 
             switch (method) {
@@ -555,14 +578,14 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
                 .pending => {
                     transfer.flags = .{ .pending = true };
                     // Bound the timeout to ensure we never hit `overflows_timeout`.
-                    transfer.timeout = 1 + std.math.min(
-                        std.math.maxInt(u64) / 2,
+                    transfer.timeout = 1 + @as(u32, @min(
+                        std.math.maxInt(u32) / 2,
                         fuzz.random_int_exponential(
                             self.random,
-                            u64,
+                            u32,
                             self.options.pending_timeout_mean,
                         ),
-                    );
+                    ));
                 },
                 .post_pending, .void_pending => {
                     // Don't depend on `HashMap.keyIterator()` being deterministic.
@@ -572,8 +595,8 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
                     var iterator = self.auditor.pending_transfers.keyIterator();
                     while (iterator.next()) |id| {
                         if (previous == null or
-                            std.math.max(target, id.*) - std.math.min(target, id.*) <
-                            std.math.max(target, previous.?) - std.math.min(target, previous.?))
+                            @max(target, id.*) - @min(target, id.*) <
+                            @max(target, previous.?) - @min(target, previous.?))
                         {
                             previous = id.*;
                         }
@@ -589,8 +612,11 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
                     transfer.debit_account_id = self.auditor.account_index_to_id(dr);
                     transfer.credit_account_id = self.auditor.account_index_to_id(cr);
                     if (method == .post_pending) {
+                        // TODO(zig): random.uintLessThanBiased does not support u128.
+                        const amount: u64 = @truncate(pending_transfer.amount);
+
                         // 1+rng for minimum amount of 1. This also makes the pending amount inclusive.
-                        transfer.amount = 1 + self.random.uintLessThanBiased(u64, pending_transfer.amount);
+                        transfer.amount = 1 + self.random.uintLessThanBiased(u64, amount);
                     } else {
                         transfer.amount = pending_transfer.amount;
                     }
@@ -622,7 +648,7 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
 
         fn transfer_id_to_index(self: *const Self, id: u128) usize {
             // -1 because id=0 is not valid, so index=0→id=1.
-            return @intCast(usize, self.options.transfer_id_permutation.decode(id)) - 1;
+            return @as(usize, @intCast(self.options.transfer_id_permutation.decode(id))) - 1;
         }
 
         fn transfer_index_to_id(self: *const Self, index: usize) u128 {
@@ -706,9 +732,9 @@ pub fn WorkloadType(comptime AccountingStateMachine: type) type {
 
                 if (result) |transfer| {
                     // The transfer exists; verify its integrity.
-                    const checksum_actual = transfer.user_data;
+                    const checksum_actual = transfer.user_data_128;
                     var check = transfer.*;
-                    check.user_data = 0;
+                    check.user_data_128 = 0;
                     check.timestamp = 0;
                     const checksum_expect = vsr.checksum(std.mem.asBytes(&check));
                     assert(checksum_expect == checksum_actual);
@@ -784,7 +810,7 @@ fn OptionsType(comptime StateMachine: type, comptime Action: type) type {
         /// This probability is only checked for consecutive invalid transfers.
         linked_invalid_probability: u8,
 
-        pending_timeout_mean: u64,
+        pending_timeout_mean: u32,
 
         accounts_batch_size_min: usize,
         accounts_batch_size_span: usize, // inclusive
@@ -828,7 +854,7 @@ fn OptionsType(comptime StateMachine: type, comptime Action: type) type {
                 .linked_invalid_probability = 100,
                 // TODO(Timeouts): When timeouts are implemented in the StateMachine, change this to the
                 // (commented out) value so that timeouts can actually trigger.
-                .pending_timeout_mean = std.math.maxInt(u64) / 2,
+                .pending_timeout_mean = std.math.maxInt(u32) / 2,
                 // .pending_timeout_mean = 1 + random.uintLessThan(usize, 1_000_000_000 / 4),
                 .accounts_batch_size_min = 0,
                 .accounts_batch_size_span = 1 + random.uintLessThan(

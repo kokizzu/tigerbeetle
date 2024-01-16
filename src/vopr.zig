@@ -8,7 +8,7 @@ const log = std.log;
 
 const simulator = @import("simulator.zig");
 const vsr = @import("vsr.zig");
-const util = @import("util.zig");
+const stdx = @import("stdx.zig");
 
 // TODO use DNS instead since hard-coding an IP address isn't ideal.
 const default_send_address = net.Address.initIp4([4]u8{ 65, 21, 207, 251 }, 5555);
@@ -138,14 +138,14 @@ fn build_simulator(
     mode: std.builtin.Mode,
 ) void {
     const mode_str = switch (mode) {
-        .Debug => "-ODebug",
-        .ReleaseSafe => "-OReleaseSafe",
+        .Debug => "-Drelease=false",
+        .ReleaseSafe => "-Drelease",
         else => unreachable,
     };
 
     const exec_result = std.ChildProcess.exec(.{
         .allocator = allocator,
-        .argv = &.{ "zig/zig", "build-exe", "./src/simulator.zig", mode_str },
+        .argv = &.{ "zig/zig", "build", "simulator", mode_str },
     }) catch |err| {
         fatal("unable to build the simulator binary. Error: {}", .{err});
     };
@@ -184,7 +184,7 @@ fn run_simulator(
     // simulator's exit code.
     const exit_code = run_child_process(
         allocator,
-        &.{ "./simulator", seed_str.items },
+        &.{ "./zig-out/bin/simulator", seed_str.items },
     );
 
     const result = switch (exit_code) {
@@ -205,7 +205,7 @@ fn run_simulator(
         }
 
         if (mode == .ReleaseSafe) {
-            log.debug("simulator exited with exit code {}.\n", .{@enumToInt(bug)});
+            log.debug("simulator exited with exit code {}.\n", .{@intFromEnum(bug)});
             log.debug("rerunning seed {} in Debug mode.\n", .{seed});
             // Build the simulator binary in Debug mode instead.
             build_simulator(allocator, .Debug);
@@ -218,11 +218,7 @@ fn run_simulator(
 // Initializes and executes the simulator as a child process.
 // Terminates the VOPR if the simulator fails to run or exits without an exit code.
 fn run_child_process(allocator: mem.Allocator, argv: []const []const u8) u8 {
-    const child_process = std.ChildProcess.init(argv, allocator) catch |err| {
-        fatal("unable to initialize simulator as a child process. Error: {}", .{err});
-    };
-    defer child_process.deinit();
-
+    var child_process = std.ChildProcess.init(argv, allocator);
     child_process.stdout = std.io.getStdOut();
     child_process.stderr = std.io.getStdErr();
 
@@ -240,7 +236,7 @@ fn run_child_process(allocator: mem.Allocator, argv: []const []const u8) u8 {
             switch (code) {
                 6 => {
                     log.debug("exit with signal: {}. Indicates a crash bug.\n", .{code});
-                    return @enumToInt(Bug.crash);
+                    return @intFromEnum(Bug.crash);
                 },
                 else => {
                     fatal("the simulator exited with an unexpected signal. Term: {}\n", .{term});
@@ -369,13 +365,13 @@ fn create_report(allocator: mem.Allocator, bug: Bug, seed: u64) Report {
     var message = Report{
         .checksum = undefined,
         .bug = bug_type,
-        .seed = @bitCast([8]u8, @byteSwap(u64, seed)),
+        .seed = @as([8]u8, @bitCast(@byteSwap(seed))),
         .commit = commit_byte_array,
     };
 
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(std.mem.asBytes(&message)[@sizeOf(u128)..45], hash[0..], .{});
-    util.copy_disjoint(.exact, u8, message.checksum[0..], hash[0..message.checksum.len]);
+    stdx.copy_disjoint(.exact, u8, message.checksum[0..], hash[0..message.checksum.len]);
 
     return message;
 }
@@ -411,21 +407,10 @@ fn parse_args(allocator: mem.Allocator) !Flags {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
-    // Keep track of the args from the ArgIterator above that were allocated
-    // then free them all at the end of the scope.
-    var args_allocated = std.ArrayList([:0]const u8).init(allocator);
-    defer {
-        for (args_allocated.items) |arg| allocator.free(arg);
-        args_allocated.deinit();
-    }
-
     // Skip argv[0] which is the name of this executable
     assert(args.skip());
 
-    while (args.next(allocator)) |arg_next| {
-        const arg = try arg_next;
-        try args_allocated.append(arg);
-
+    while (args.next()) |arg| {
         if (mem.startsWith(u8, arg, "--seed")) {
             const seed_string = parse_flag("--seed", arg);
             seed = simulator.parse_seed(seed_string);
@@ -439,7 +424,7 @@ fn parse_args(allocator: mem.Allocator) !Flags {
                 send_address = default_send_address;
             } else {
                 const str_address = parse_flag("--send", arg);
-                send_address = try vsr.parse_address(str_address);
+                send_address = try vsr.parse_address_and_port(str_address);
             }
         } else if (mem.startsWith(u8, arg, "--build-mode")) {
             if (mem.eql(u8, parse_flag("--build-mode", arg), "ReleaseSafe")) {

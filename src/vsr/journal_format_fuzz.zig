@@ -4,18 +4,15 @@ const assert = std.debug.assert;
 const log = std.log.scoped(.fuzz_journal_format);
 
 const constants = @import("../constants.zig");
-const util = @import("../util.zig");
+const stdx = @import("../stdx.zig");
 const vsr = @import("../vsr.zig");
 const journal = @import("./journal.zig");
-const fuzz = @import("../test/fuzz.zig");
-
-pub const tigerbeetle_config = @import("../config.zig").configs.test_min;
+const fuzz = @import("../testing/fuzz.zig");
+const allocator = fuzz.allocator;
 
 const cluster = 0;
 
-pub fn main() !void {
-    const allocator = std.testing.allocator;
-    const args = try fuzz.parse_fuzz_args(allocator);
+pub fn main(args: fuzz.FuzzArgs) !void {
     var prng = std.rand.DefaultPrng.init(args.seed);
 
     // +10 to occasionally test formatting into a buffer larger than the total data size.
@@ -34,16 +31,16 @@ pub fn fuzz_format_wal_headers(write_size_max: usize) !void {
     assert(write_size_max % @sizeOf(vsr.Header) == 0);
     assert(write_size_max % constants.sector_size == 0);
 
-    const write = try std.testing.allocator.alloc(u8, write_size_max);
-    defer std.testing.allocator.free(write);
+    const write = try allocator.alloc(u8, write_size_max);
+    defer allocator.free(write);
 
     var offset: usize = 0;
     while (offset < constants.journal_size_headers) {
         const write_size = journal.format_wal_headers(cluster, offset, write);
         defer offset += write_size;
 
-        const write_headers = std.mem.bytesAsSlice(vsr.Header, write[0..write_size]);
-        for (write_headers) |header, i| {
+        const write_headers = std.mem.bytesAsSlice(vsr.Header.Prepare, write[0..write_size]);
+        for (write_headers, 0..) |header, i| {
             const slot = @divExact(offset, @sizeOf(vsr.Header)) + i;
             try verify_slot_header(slot, header);
         }
@@ -56,8 +53,8 @@ pub fn fuzz_format_wal_prepares(write_size_max: usize) !void {
     assert(write_size_max % @sizeOf(vsr.Header) == 0);
     assert(write_size_max % constants.sector_size == 0);
 
-    const write = try std.testing.allocator.alloc(u8, write_size_max);
-    defer std.testing.allocator.free(write);
+    const write = try allocator.alloc(u8, write_size_max);
+    defer allocator.free(write);
 
     var offset: usize = 0;
     while (offset < constants.journal_size_prepares) {
@@ -67,6 +64,7 @@ pub fn fuzz_format_wal_prepares(write_size_max: usize) !void {
         var offset_checked: usize = 0;
         while (offset_checked < write_size) {
             const offset_header_next = std.mem.alignForward(
+                usize,
                 offset + offset_checked,
                 constants.message_size_max,
             ) - offset;
@@ -75,13 +73,13 @@ pub fn fuzz_format_wal_prepares(write_size_max: usize) !void {
                 // Message header.
                 const slot = @divExact(offset + offset_checked, constants.message_size_max);
                 const header_bytes = write[offset_checked..][0..@sizeOf(vsr.Header)];
-                const header = std.mem.bytesToValue(vsr.Header, header_bytes);
+                const header = std.mem.bytesToValue(vsr.Header.Prepare, header_bytes);
 
                 try verify_slot_header(slot, header);
                 offset_checked += @sizeOf(vsr.Header);
             } else {
                 // Message body.
-                const offset_message_end = std.math.min(offset_header_next, write_size);
+                const offset_message_end = @min(offset_header_next, write_size);
                 const message_body_bytes = write[offset_checked..offset_message_end];
                 var byte: usize = 0;
                 for (std.mem.bytesAsSlice(usize, message_body_bytes)) |b| byte |= b;
@@ -95,17 +93,17 @@ pub fn fuzz_format_wal_prepares(write_size_max: usize) !void {
     assert(offset == constants.journal_size_prepares);
 }
 
-fn verify_slot_header(slot: usize, header: vsr.Header) !void {
+fn verify_slot_header(slot: usize, header: vsr.Header.Prepare) !void {
     try std.testing.expect(header.valid_checksum());
     try std.testing.expect(header.valid_checksum_body(&[0]u8{}));
     try std.testing.expectEqual(header.invalid(), null);
     try std.testing.expectEqual(header.cluster, cluster);
     try std.testing.expectEqual(header.op, slot);
     try std.testing.expectEqual(header.size, @sizeOf(vsr.Header));
+    try std.testing.expectEqual(header.command, .prepare);
     if (slot == 0) {
-        try std.testing.expectEqual(header.command, .prepare);
         try std.testing.expectEqual(header.operation, .root);
     } else {
-        try std.testing.expectEqual(header.command, .reserved);
+        try std.testing.expectEqual(header.operation, .reserved);
     }
 }

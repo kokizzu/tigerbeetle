@@ -13,9 +13,9 @@ pub const IO = struct {
     kq: os.fd_t,
     time: Time = .{},
     io_inflight: usize = 0,
-    timeouts: FIFO(Completion) = .{},
-    completed: FIFO(Completion) = .{},
-    io_pending: FIFO(Completion) = .{},
+    timeouts: FIFO(Completion) = .{ .name = "io_timeouts" },
+    completed: FIFO(Completion) = .{ .name = "io_completed" },
+    io_pending: FIFO(Completion) = .{ .name = "io_pending" },
 
     pub fn init(entries: u12, flags: u32) !IO {
         _ = entries;
@@ -94,8 +94,8 @@ pub const IO = struct {
             if (change_events == 0 and self.completed.empty()) {
                 if (wait_for_completions) {
                     const timeout_ns = next_timeout orelse @panic("kevent() blocking forever");
-                    ts.tv_nsec = @intCast(@TypeOf(ts.tv_nsec), timeout_ns % std.time.ns_per_s);
-                    ts.tv_sec = @intCast(@TypeOf(ts.tv_sec), timeout_ns / std.time.ns_per_s);
+                    ts.tv_nsec = @as(@TypeOf(ts.tv_nsec), @intCast(timeout_ns % std.time.ns_per_s));
+                    ts.tv_sec = @as(@TypeOf(ts.tv_sec), @intCast(timeout_ns / std.time.ns_per_s));
                 } else if (self.io_inflight == 0) {
                     return;
                 }
@@ -118,21 +118,21 @@ pub const IO = struct {
             self.io_inflight -= new_events;
 
             for (events[0..new_events]) |event| {
-                const completion = @intToPtr(*Completion, event.udata);
+                const completion = @as(*Completion, @ptrFromInt(event.udata));
                 completion.next = null;
                 self.completed.push(completion);
             }
         }
 
         var completed = self.completed;
-        self.completed = .{};
+        self.completed.reset();
         while (completed.pop()) |completion| {
             (completion.callback)(self, completion);
         }
     }
 
     fn flush_io(_: *IO, events: []os.Kevent, io_pending_top: *?*Completion) usize {
-        for (events) |*event, flushed| {
+        for (events, 0..) |*event, flushed| {
             const completion = io_pending_top.* orelse return flushed;
             io_pending_top.* = completion.next;
 
@@ -147,12 +147,12 @@ pub const IO = struct {
             };
 
             event.* = .{
-                .ident = @intCast(u32, event_info[0]),
-                .filter = @intCast(i16, event_info[1]),
+                .ident = @as(u32, @intCast(event_info[0])),
+                .filter = @as(i16, @intCast(event_info[1])),
                 .flags = os.system.EV_ADD | os.system.EV_ENABLE | os.system.EV_ONESHOT,
                 .fflags = 0,
                 .data = 0,
-                .udata = @ptrToInt(completion),
+                .udata = @intFromPtr(completion),
             };
         }
         return events.len;
@@ -178,7 +178,7 @@ pub const IO = struct {
 
             const timeout_ns = expires - now;
             if (min_timeout) |min_ns| {
-                min_timeout = std.math.min(min_ns, timeout_ns);
+                min_timeout = @min(min_ns, timeout_ns);
             } else {
                 min_timeout = timeout_ns;
             }
@@ -190,7 +190,7 @@ pub const IO = struct {
     pub const Completion = struct {
         next: ?*Completion,
         context: ?*anyopaque,
-        callback: fn (*IO, *Completion) void,
+        callback: *const fn (*IO, *Completion) void,
         operation: Operation,
     };
 
@@ -242,7 +242,6 @@ pub const IO = struct {
         operation_data: anytype,
         comptime OperationImpl: type,
     ) void {
-        const Context = @TypeOf(context);
         const onCompleteFn = struct {
             fn onComplete(io: *IO, _completion: *Completion) void {
                 // Perform the actual operaton
@@ -265,8 +264,9 @@ pub const IO = struct {
                 }
 
                 // Complete the Completion
+
                 return callback(
-                    @intToPtr(Context, @ptrToInt(_completion.context)),
+                    @ptrCast(@alignCast(_completion.context)),
                     _completion,
                     result,
                 );
@@ -455,7 +455,7 @@ pub const IO = struct {
             .{
                 .fd = fd,
                 .buf = buffer.ptr,
-                .len = @intCast(u32, buffer_limit(buffer.len)),
+                .len = @as(u32, @intCast(buffer_limit(buffer.len))),
                 .offset = offset,
             },
             struct {
@@ -465,10 +465,10 @@ pub const IO = struct {
                             op.fd,
                             op.buf,
                             op.len,
-                            @bitCast(isize, op.offset),
+                            @as(isize, @bitCast(op.offset)),
                         );
                         return switch (os.errno(rc)) {
-                            .SUCCESS => @intCast(usize, rc),
+                            .SUCCESS => @as(usize, @intCast(rc)),
                             .INTR => continue,
                             .AGAIN => error.WouldBlock,
                             .BADF => error.NotOpenForReading,
@@ -514,7 +514,7 @@ pub const IO = struct {
             .{
                 .socket = socket,
                 .buf = buffer.ptr,
-                .len = @intCast(u32, buffer_limit(buffer.len)),
+                .len = @as(u32, @intCast(buffer_limit(buffer.len))),
             },
             struct {
                 fn do_operation(op: anytype) RecvError!usize {
@@ -547,7 +547,7 @@ pub const IO = struct {
             .{
                 .socket = socket,
                 .buf = buffer.ptr,
-                .len = @intCast(u32, buffer_limit(buffer.len)),
+                .len = @as(u32, @intCast(buffer_limit(buffer.len))),
             },
             struct {
                 fn do_operation(op: anytype) SendError!usize {
@@ -571,6 +571,25 @@ pub const IO = struct {
         completion: *Completion,
         nanoseconds: u63,
     ) void {
+        // Special case a zero timeout as a yield.
+        if (nanoseconds == 0) {
+            completion.* = .{
+                .next = null,
+                .context = context,
+                .operation = undefined,
+                .callback = struct {
+                    fn on_complete(_io: *IO, _completion: *Completion) void {
+                        _ = _io;
+                        const _context: Context = @ptrCast(@alignCast(_completion.context));
+                        callback(_context, _completion, {});
+                    }
+                }.on_complete,
+            };
+
+            self.completed.push(completion);
+            return;
+        }
+
         self.submit(
             context,
             callback,
@@ -611,7 +630,7 @@ pub const IO = struct {
             .{
                 .fd = fd,
                 .buf = buffer.ptr,
-                .len = @intCast(u32, buffer_limit(buffer.len)),
+                .len = @as(u32, @intCast(buffer_limit(buffer.len))),
                 .offset = offset,
             },
             struct {
@@ -655,10 +674,9 @@ pub const IO = struct {
         dir_fd: os.fd_t,
         relative_path: []const u8,
         size: u64,
-        must_create: bool,
+        method: enum { create, create_or_open, open },
     ) !os.fd_t {
         assert(relative_path.len > 0);
-        assert(size >= constants.sector_size);
         assert(size % constants.sector_size == 0);
 
         // TODO Use O_EXCL when opening as a block device to obtain a mandatory exclusive lock.
@@ -672,13 +690,21 @@ pub const IO = struct {
         // TODO Document this and investigate whether this is in fact correct to set here.
         if (@hasDecl(os.O, "LARGEFILE")) flags |= os.O.LARGEFILE;
 
-        if (must_create) {
-            log.info("creating \"{s}\"...", .{relative_path});
-            flags |= os.O.CREAT;
-            flags |= os.O.EXCL;
-            mode = 0o666;
-        } else {
-            log.info("opening \"{s}\"...", .{relative_path});
+        switch (method) {
+            .create => {
+                flags |= os.O.CREAT;
+                flags |= os.O.EXCL;
+                mode = 0o666;
+                log.info("creating \"{s}\"...", .{relative_path});
+            },
+            .create_or_open => {
+                flags |= os.O.CREAT;
+                mode = 0o666;
+                log.info("opening or creating \"{s}\"...", .{relative_path});
+            },
+            .open => {
+                log.info("opening \"{s}\"...", .{relative_path});
+            },
         }
 
         // This is critical as we rely on O_DSYNC for fsync() whenever we write to the file:
@@ -708,7 +734,7 @@ pub const IO = struct {
         // Ask the file system to allocate contiguous sectors for the file (if possible):
         // If the file system does not support `fallocate()`, then this could mean more seeks or a
         // panic if we run out of disk space (ENOSPC).
-        if (must_create) try fs_allocate(fd, size);
+        if (method == .create) try fs_allocate(fd, size);
 
         // The best fsync strategy is always to fsync before reading because this prevents us from
         // making decisions on data that was never durably written by a previously crashed process.
@@ -760,15 +786,15 @@ pub const IO = struct {
             .fst_flags = F_ALLOCATECONTIG | F_ALLOCATEALL,
             .fst_posmode = F_PEOFPOSMODE,
             .fst_offset = 0,
-            .fst_length = @intCast(os.off_t, size),
+            .fst_length = @as(os.off_t, @intCast(size)),
             .fst_bytesalloc = 0,
         };
 
         // Try to pre-allocate contiguous space and fall back to default non-contiguous.
-        var res = os.system.fcntl(fd, os.F.PREALLOCATE, @ptrToInt(&store));
+        var res = os.system.fcntl(fd, os.F.PREALLOCATE, @intFromPtr(&store));
         if (os.errno(res) != .SUCCESS) {
             store.fst_flags = F_ALLOCATEALL;
-            res = os.system.fcntl(fd, os.F.PREALLOCATE, @ptrToInt(&store));
+            res = os.system.fcntl(fd, os.F.PREALLOCATE, @intFromPtr(&store));
         }
 
         switch (os.errno(res)) {

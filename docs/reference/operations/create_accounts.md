@@ -28,13 +28,18 @@ The [`Account.flags.linked`](../accounts.md#flagslinked) flag was set on the las
 batch, which is not legal. (`flags.linked` indicates that the chain continues to the next
 operation).
 
-### `reserved_flag`
+### `timestamp_must_be_zero`
 The account was not created.
-[`Account.flags.reserved`](../accounts.md#flagsreserved) is nonzero, but must be zero.
+The [`Account.timestamp`](../accounts.md#timestamp) is nonzero, but must be zero.
+The cluster is responsible for setting this field.
 
 ### `reserved_field`
 The account was not created.
 [`Account.reserved`](../accounts.md#reserved) is nonzero, but must be zero.
+
+### `reserved_flag`
+The account was not created.
+`Account.flags.reserved` is nonzero, but must be zero.
 
 ### `id_must_not_be_zero`
 The account was not created.
@@ -44,13 +49,14 @@ The account was not created.
 The account was not created.
 [`Account.id`](../accounts.md#id) is `2^128 - 1`, which is a reserved value.
 
-### `ledger_must_not_be_zero`
+### `flags_are_mutually_exclusive`
 The account was not created.
-[`Account.ledger`](../accounts.md#ledger) is zero, but must be nonzero.
+An account cannot be created with the specified combination of
+[`Account.flags`](../accounts.md#flags).
 
-### `code_must_not_be_zero`
-The account was not created.
-[`Account.code`](../accounts.md#code) is zero, but must be nonzero.
+The following flags are mutually exclusive:
+- [`Account.flags.debits_must_not_exceed_credits`](../accounts.md#flagsdebits_must_not_exceed_credits)
+- [`Account.flags.credits_must_not_exceed_debits`](../accounts.md#flagscredits_must_not_exceed_debits)
 
 ### `debits_pending_must_be_zero`
 The account was not created.
@@ -76,21 +82,28 @@ The account was not created.
 
 An account's debits and credits are only modified by transfers.
 
-### `mutually_exclusive_flags`
+### `ledger_must_not_be_zero`
 The account was not created.
-An account cannot be created with the specified combination of
-[`Account.flags`](../accounts.md#flags).
+[`Account.ledger`](../accounts.md#ledger) is zero, but must be nonzero.
 
-The following flags are mutually exclusive:
-- [`Account.flags.debits_must_not_exceed_credits`](../accounts.md#flagsdebits_must_not_exceed_credits)
-- [`Account.flags.credits_must_not_exceed_debits`](../accounts.md#flagscredits_must_not_exceed_debits)
+### `code_must_not_be_zero`
+The account was not created.
+[`Account.code`](../accounts.md#code) is zero, but must be nonzero.
 
 ### `exists_with_different_flags`
 An account with the same `id` already exists, but with different [`flags`](../accounts.md#flags).
 
-### `exists_with_different_user_data`
+### `exists_with_different_user_data_128`
 An account with the same `id` already exists, but with different
-[`user_data`](../accounts.md#user_data).
+[`user_data_128`](../accounts.md#user_data_128).
+
+### `exists_with_different_user_data_64`
+An account with the same `id` already exists, but with different
+[`user_data_64`](../accounts.md#user_data_64).
+
+### `exists_with_different_user_data_32`
+An account with the same `id` already exists, but with different
+[`user_data_32`](../accounts.md#user_data_32).
 
 ### `exists_with_different_ledger`
 An account with the same `id` already exists, but with different [`ledger`](../accounts.md#ledger).
@@ -109,5 +122,21 @@ account in the request:
 - `credits_posted`
 
 To correctly recover from application crashes
-[many applications](../../usage/integration.md#conistency-with-foreign-databases) should handle
+[many applications](../../design/consistency.md#consistency-with-foreign-databases) should handle
 `exists` exactly as [`ok`](#ok).
+
+## Client libraries
+
+For language-specific docs see:
+
+* [Creating accounts using the .NET library](/src/clients/dotnet/README.md#creating-accounts)
+* [Creating accounts using the Java library](/src/clients/java/README.md#creating-accounts)
+* [Creating accounts using the Go library](/src/clients/go/README.md#creating-accounts)
+* [Creating accounts using the Node.js library](/src/clients/node/README.md#creating-accounts)
+
+## Internals
+
+If you're curious and want to learn more, you can find the source code
+for creating an account in
+[src/state_machine.zig](https://github.com/tigerbeetle/tigerbeetle/blob/main/src/state_machine.zig). Search
+for `fn create_account(` and `fn execute(`.

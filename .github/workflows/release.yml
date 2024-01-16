@@ -1,40 +1,68 @@
-name: Build and publish artifacts
+name: Release
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch: # Manual triggering to re-run a release with a different run_number
+  push:
+    branches:
+      - release
 
 jobs:
-  build_and_upload_binaries:
-    strategy:
-      matrix:
-        debug: ["", "--debug"]
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  release:
+    runs-on: ubuntu-latest
+    environment: release
 
     steps:
-    - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
+        with:
+          ref: release # Use the 'release' branch even if triggered manually
 
-    - name: Build tigerbeetle
-      run: ./scripts/install.sh ${{ matrix.debug }}
+      - uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version:
+            7.0.x
 
-    - name: Store current tag
-      run: echo "GIT_TAG=`git tag --points-at HEAD`" >> $GITHUB_ENV
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '1.18'
 
-    # Note: this only creates builds on the platform being built. So
-    # this does not build for M1 Macs. Maybe in the future we could
-    # use Zig's cross-platform builds instead of relying on the
-    # current platform and different Github Actions runners.
-    - name: Create zip of release build
-      run: zip -9 tigerbeetle-$RUNNER_OS-x64-$GIT_TAG${{ matrix.debug }}.zip tigerbeetle
+      - uses: actions/setup-java@v3
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          server-id: ossrh
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_CENTRAL_TOKEN
+          gpg-private-key: ${{ secrets.MAVEN_GPG_SECRET_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
 
-    - name: Get Github ID for tag
-      run: |
-        echo "RELEASE_ID=`curl -H 'Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}' https://api.github.com/repos/tigerbeetledb/tigerbeetle/releases/tags/$GIT_TAG | jq '.id'`" >> $GITHUB_ENV
-    - name: Upload on release
-      run: |
-        curl --fail \
-          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-          -H "Content-Type: application/zip" \
-          --data-binary @./tigerbeetle-$RUNNER_OS-x64-$GIT_TAG${{ matrix.debug }}.zip \
-          "https://uploads.github.com/repos/tigerbeetledb/tigerbeetle/releases/$RELEASE_ID/assets?name=tigerbeetle-$RUNNER_OS-x64-$GIT_TAG${{ matrix.debug }}.zip"
+      # No special setup for Go.
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18.x'
+          registry-url: 'https://registry.npmjs.org'
+
+      # We need llvm-lipo utility from LLVM to build a universal mac binary.
+      - run: wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 16
+      - run: ./scripts/install_zig.sh
+      - run: ./zig/zig build scripts -- release --build --publish --version=0.14.${{ github.run_number }} --sha=${{ github.sha }}
+        env:
+          NUGET_KEY: ${{ secrets.NUGET_KEY }}
+          TIGERBEETLE_GO_PAT: ${{ secrets.TIGERBEETLE_GO_PAT }}
+          TIGERBEETLE_DOCS_PAT: ${{ secrets.TIGERBEETLE_DOCS_PAT }}
+          MAVEN_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_TOKEN: ${{ secrets.MAVEN_CENTRAL_TOKEN }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_SECRET_KEY_PASSWORD }}
+          NODE_AUTH_TOKEN: ${{ secrets.TIGERBEETLE_NODE_PUBLISH_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+  alert_failure:
+    runs-on: ubuntu-latest
+    needs: [release]
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    steps:
+      - name: Alert if anything failed
+        run: |
+          export URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" && \
+          curl -d "text=Release process for 0.14.${{ github.run_number }} failed! See ${URL} for more information." -d "channel=C04RWHT9EP5" -H "Authorization: Bearer ${{ secrets.SLACK_TOKEN }}" -X POST https://slack.com/api/chat.postMessage

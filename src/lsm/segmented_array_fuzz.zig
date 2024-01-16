@@ -1,9 +1,9 @@
 const std = @import("std");
 
-const fuzz = @import("../test/fuzz.zig");
+const fuzz = @import("../testing/fuzz.zig");
 const segmented_array = @import("segmented_array.zig");
 
-pub fn main() !void {
-    const fuzz_args = try fuzz.parse_fuzz_args(std.testing.allocator);
-    try segmented_array.run_tests(fuzz_args.seed, .{ .verify = true });
+pub fn main(fuzz_args: fuzz.FuzzArgs) !void {
+    const allocator = fuzz.allocator;
+    try segmented_array.run_fuzz(allocator, fuzz_args.seed, .{ .verify = true });
 }

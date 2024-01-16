@@ -29,19 +29,85 @@ Constraints:
 * Must not be zero or `2^128 - 1` (the highest 128-bit unsigned integer)
 * Must not conflict with another account
 
-### `user_data`
+### `debits_pending`
 
-This is an optional secondary identifier to link this account to an
-external entity.
+`debits_pending` counts debits reserved by pending transfers. When a pending transfer posts, voids,
+or times out, the amount is removed from `debits_pending`.
 
-As an example, you might use a [random id](../usage/data-modeling.md#random-identifer)
-that ties together a group of accounts.
-
-For more information, see [Data Modeling](../usage/data-modeling.md#user_data).
+Money in `debits_pending` is reserved — that is, it cannot be spent until the corresponding pending
+transfer resolves.
 
 Constraints:
 
 * Type is 128-bit unsigned integer (16 bytes)
+* Must be zero when the account is created
+
+### `debits_posted`
+
+Amount of posted debits.
+
+Constraints:
+
+* Type is 128-bit unsigned integer (16 bytes)
+* Must be zero when the account is created
+
+### `credits_pending`
+
+Amount of pending credits.
+
+Constraints:
+
+* Type is 128-bit unsigned integer (16 bytes)
+* Must be zero when the account is created
+
+### `credits_posted`
+
+Amount of posted credits.
+
+Constraints:
+
+* Type is 128-bit unsigned integer (16 bytes)
+* Must be zero when the account is created
+
+### `user_data_128`
+
+This is an optional 128-bit secondary identifier to link this account to an
+external entity or event.
+
+As an example, you might use a [ULID](../design/data-modeling.md#time-based-identifiers)
+that ties together a group of accounts.
+
+For more information, see [Data Modeling](../design/data-modeling.md#user_data).
+
+Constraints:
+
+* Type is 128-bit unsigned integer (16 bytes)
+
+### `user_data_64`
+
+This is an optional 64-bit secondary identifier to link this account to an
+external entity or event.
+
+As an example, you might use this field store an external timestamp.
+
+For more information, see [Data Modeling](../design/data-modeling.md#user_data).
+
+Constraints:
+
+* Type is 64-bit unsigned integer (8 bytes)
+
+### `user_data_32`
+
+This is an optional 32-bit secondary identifier to link this account to an
+external entity or event.
+
+As an example, you might use this field to store a timezone or locale.
+
+For more information, see [Data Modeling](../design/data-modeling.md#user_data).
+
+Constraints:
+
+* Type is 32-bit unsigned integer (4 bytes)
 
 ### `reserved`
 
@@ -49,7 +115,7 @@ This space may be used for additional data in the future.
 
 Constraints:
 
-* Type is 48 bytes
+* Type is 4 bytes
 * Must be zero
 
 ### `ledger`
@@ -57,7 +123,7 @@ Constraints:
 This is an identifier that partitions the sets of accounts that can
 transact with each other. Put another way, money cannot transfer
 between two accounts with different `ledger` values. See:
-[`accounts_must_have_the_same_ledger`](./operations/create_accounts.md#accounts_must_have_the_same_ledger).
+[`accounts_must_have_the_same_ledger`](./operations/create_transfers.md#accounts_must_have_the_same_ledger).
 
 [Currency exchange](../recipes/currency-exchange.md) is implemented with two or more linked
 transfers.
@@ -90,6 +156,8 @@ A bitfield that toggles additional behavior.
 Constraints:
 
 * Type is 16-bit unsigned integer (2 bytes)
+* Some flags are mutually exclusive; see
+  [`flags_are_mutually_exclusive`](./operations/create_accounts.md#flags_are_mutually_exclusive).
 
 #### `flags.linked`
 
@@ -112,7 +180,7 @@ result set to
 
 After the link has executed, the association of each event is lost.
 To save the association, it must be
-[encoded into the data model](../usage/data-modeling.md).
+[encoded into the data model](../design/data-modeling.md).
 
 #### `flags.debits_must_not_exceed_credits`
 
@@ -129,46 +197,6 @@ credits to exceed debits. Specifically when `account.credits_pending +
 account.credits_posted + transfer.amount > account.debits_posted`.
 
 This cannot be set when `debits_must_not_exceed_credits` is also set.
-
-### `debits_pending`
-
-`debits_pending` counts debits reserved by pending transfers. When a pending transfer posts, voids,
-or times out, the amount is removed from `debits_pending`.
-
-Money in `debits_pending` is reserved — that is, it cannot be spent until the corresponding pending
-transfer resolves.
-
-Constraints:
-
-* Type is 64-bit unsigned integer (8 bytes)
-* Must be zero when the account is created
-
-### `debits_posted`
-
-Amount of posted debits.
-
-Constraints:
-
-* Type is 64-bit unsigned integer (8 bytes)
-* Must be zero when the account is created
-
-### `credits_pending`
-
-Amount of pending credits.
-
-Constraints:
-
-* Type is 64-bit unsigned integer (8 bytes)
-* Must be zero when the account is created
-
-### `credits_posted`
-
-Amount of posted credits.
-
-Constraints:
-
-* Type is 64-bit unsigned integer (8 bytes)
-* Must be zero when the account is created
 
 ### `timestamp`
 
@@ -194,9 +222,9 @@ Constraints:
 
 If you're curious and want to learn more, you can find the source code
 for this struct in
-[src/tigerbeetle.zig](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/tigerbeetle.zig). Search
+[src/tigerbeetle.zig](https://github.com/tigerbeetle/tigerbeetle/blob/main/src/tigerbeetle.zig). Search
 for `const Account = extern struct {`.
 
 You can find the source code for creating an account in
-[src/state_machine.zig](https://github.com/tigerbeetledb/tigerbeetle/blob/main/src/state_machine.zig). Search
+[src/state_machine.zig](https://github.com/tigerbeetle/tigerbeetle/blob/main/src/state_machine.zig). Search
 for `fn create_account(`.

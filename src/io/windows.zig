@@ -12,8 +12,8 @@ pub const IO = struct {
     iocp: os.windows.HANDLE,
     timer: Time = .{},
     io_pending: usize = 0,
-    timeouts: FIFO(Completion) = .{},
-    completed: FIFO(Completion) = .{},
+    timeouts: FIFO(Completion) = .{ .name = "io_timeouts" },
+    completed: FIFO(Completion) = .{ .name = "io_completed" },
 
     pub fn init(entries: u12, flags: u32) !IO {
         _ = entries;
@@ -62,7 +62,7 @@ pub const IO = struct {
     };
 
     fn flush(self: *IO, mode: FlushMode) !void {
-        if (self.completed.peek() == null) {
+        if (self.completed.empty()) {
             // Compute how long to poll by flushing timeout completions.
             // NOTE: this may push to completed queue
             var timeout_ms: ?os.windows.DWORD = null;
@@ -72,13 +72,13 @@ pub const IO = struct {
                 // Round up sub-millisecond expire times to the next millisecond
                 const expires_ms = (expires_ns + (std.time.ns_per_ms / 2)) / std.time.ns_per_ms;
                 // Saturating cast to DWORD milliseconds
-                const expires = std.math.cast(os.windows.DWORD, expires_ms) catch std.math.maxInt(os.windows.DWORD);
+                const expires = std.math.cast(os.windows.DWORD, expires_ms) orelse std.math.maxInt(os.windows.DWORD);
                 // max DWORD is reserved for INFINITE so cap the cast at max - 1
                 timeout_ms = if (expires == os.windows.INFINITE) expires - 1 else expires;
             }
 
             // Poll for IO iff theres IO pending and flush_timeouts() found no ready completions
-            if (self.io_pending > 0 and self.completed.peek() == null) {
+            if (self.io_pending > 0 and self.completed.empty()) {
                 // In blocking mode, we're always waiting at least until the timeout by run_for_ns.
                 // In non-blocking mode, we shouldn't wait at all.
                 const io_timeout = switch (mode) {
@@ -87,7 +87,7 @@ pub const IO = struct {
                 };
 
                 var events: [64]os.windows.OVERLAPPED_ENTRY = undefined;
-                const num_events = os.windows.GetQueuedCompletionStatusEx(
+                const num_events: u32 = os.windows.GetQueuedCompletionStatusEx(
                     self.iocp,
                     &events,
                     io_timeout,
@@ -115,7 +115,7 @@ pub const IO = struct {
         // Must read all `completions` before invoking the callbacks
         // as the callbacks could potentially submit more completions.
         var completed = self.completed;
-        self.completed = .{};
+        self.completed.reset();
         while (completed.pop()) |completion| {
             (completion.callback)(Completion.Context{
                 .io = self,
@@ -147,7 +147,7 @@ pub const IO = struct {
             // if it's still waiting, update min_timeout
             const expires = completion.operation.timeout.deadline - now;
             if (min_expires) |current_min_expires| {
-                min_expires = std.math.min(expires, current_min_expires);
+                min_expires = @min(expires, current_min_expires);
             } else {
                 min_expires = expires;
             }
@@ -160,7 +160,7 @@ pub const IO = struct {
     pub const Completion = struct {
         next: ?*Completion,
         context: ?*anyopaque,
-        callback: fn (Context) void,
+        callback: *const fn (Context) void,
         operation: Operation,
 
         const Context = struct {
@@ -225,7 +225,6 @@ pub const IO = struct {
         op_data: anytype,
         comptime OperationImpl: type,
     ) void {
-        const Context = @TypeOf(context);
         const Callback = struct {
             fn onComplete(ctx: Completion.Context) void {
                 // Perform the operation and get the result
@@ -248,7 +247,7 @@ pub const IO = struct {
 
                 // The completion is finally ready to invoke the callback
                 callback(
-                    @intToPtr(Context, @ptrToInt(ctx.completion.context)),
+                    @ptrCast(@alignCast(ctx.completion.context)),
                     ctx.completion,
                     result,
                 );
@@ -258,7 +257,7 @@ pub const IO = struct {
         // Setup the completion with the callback wrapper above
         completion.* = .{
             .next = null,
-            .context = @ptrCast(?*anyopaque, context),
+            .context = @as(?*anyopaque, @ptrCast(context)),
             .callback = Callback.onComplete,
             .operation = @unionInit(Completion.Operation, @tagName(op_tag), op_data),
         };
@@ -356,15 +355,13 @@ pub const IO = struct {
                     }
 
                     // destroy the client_socket we created if we get a non WouldBlock error
-                    errdefer |result| {
-                        _ = result catch |err| switch (err) {
-                            error.WouldBlock => {},
-                            else => {
-                                os.closeSocket(op.client_socket);
-                                op.client_socket = INVALID_SOCKET;
-                            },
-                        };
-                    }
+                    errdefer |err| switch (err) {
+                        error.WouldBlock => {},
+                        else => {
+                            os.closeSocket(op.client_socket);
+                            op.client_socket = INVALID_SOCKET;
+                        },
+                    };
 
                     return switch (os.windows.ws2_32.WSAGetLastError()) {
                         .WSA_IO_PENDING, .WSAEWOULDBLOCK, .WSA_IO_INCOMPLETE => error.WouldBlock,
@@ -453,7 +450,7 @@ pub const IO = struct {
                             else => |e| return e,
                         };
 
-                        const LPFN_CONNECTEX = fn (
+                        const LPFN_CONNECTEX = *const fn (
                             Socket: os.windows.ws2_32.SOCKET,
                             SockAddr: *const os.windows.ws2_32.sockaddr,
                             SockLen: os.socklen_t,
@@ -464,15 +461,29 @@ pub const IO = struct {
                         ) callconv(os.windows.WINAPI) os.windows.BOOL;
 
                         // Find the ConnectEx function by dynamically looking it up on the socket.
-                        const connect_ex = os.windows.loadWinsockExtensionFunction(
-                            LPFN_CONNECTEX,
+                        // TODO: use `os.windows.loadWinsockExtensionFunction` once the function
+                        //       pointer is no longer required to be comptime.
+                        var connect_ex: LPFN_CONNECTEX = undefined;
+                        var num_bytes: os.windows.DWORD = undefined;
+                        const guid = os.windows.ws2_32.WSAID_CONNECTEX;
+                        switch (os.windows.ws2_32.WSAIoctl(
                             op.socket,
-                            os.windows.ws2_32.WSAID_CONNECTEX,
-                        ) catch |err| switch (err) {
-                            error.OperationNotSupported => unreachable,
-                            error.ShortRead => unreachable,
-                            else => |e| return e,
-                        };
+                            os.windows.ws2_32.SIO_GET_EXTENSION_FUNCTION_POINTER,
+                            @as(*const anyopaque, @ptrCast(&guid)),
+                            @sizeOf(os.windows.GUID),
+                            @as(*anyopaque, @ptrCast(&connect_ex)),
+                            @sizeOf(LPFN_CONNECTEX),
+                            &num_bytes,
+                            null,
+                            null,
+                        )) {
+                            os.windows.ws2_32.SOCKET_ERROR => switch (os.windows.ws2_32.WSAGetLastError()) {
+                                .WSAEOPNOTSUPP => unreachable,
+                                .WSAENOTSOCK => unreachable,
+                                else => |err| return os.windows.unexpectedWSAError(err),
+                            },
+                            else => assert(num_bytes == @sizeOf(LPFN_CONNECTEX)),
+                        }
 
                         op.pending = true;
                         op.overlapped = .{
@@ -545,8 +556,8 @@ pub const IO = struct {
         const transfer = Completion.Transfer{
             .socket = socket,
             .buf = os.windows.ws2_32.WSABUF{
-                .len = @intCast(u32, buffer_limit(buffer.len)),
-                .buf = @intToPtr([*]u8, @ptrToInt(buffer.ptr)),
+                .len = @as(u32, @intCast(buffer_limit(buffer.len))),
+                .buf = @constCast(buffer.ptr),
             },
             .overlapped = undefined,
             .pending = false,
@@ -584,7 +595,7 @@ pub const IO = struct {
                         // Start the send operation.
                         break :blk switch (os.windows.ws2_32.WSASend(
                             op.socket,
-                            @ptrCast([*]os.windows.ws2_32.WSABUF, &op.buf),
+                            @as([*]os.windows.ws2_32.WSABUF, @ptrCast(&op.buf)),
                             1, // one buffer
                             &transferred,
                             0, // no flags
@@ -645,7 +656,7 @@ pub const IO = struct {
         const transfer = Completion.Transfer{
             .socket = socket,
             .buf = os.windows.ws2_32.WSABUF{
-                .len = @intCast(u32, buffer_limit(buffer.len)),
+                .len = @as(u32, @intCast(buffer_limit(buffer.len))),
                 .buf = buffer.ptr,
             },
             .overlapped = undefined,
@@ -684,7 +695,7 @@ pub const IO = struct {
                         // Start the recv operation.
                         break :blk switch (os.windows.ws2_32.WSARecv(
                             op.socket,
-                            @ptrCast([*]os.windows.ws2_32.WSABUF, &op.buf),
+                            @as([*]os.windows.ws2_32.WSABUF, @ptrCast(&op.buf)),
                             1, // one buffer
                             &transferred,
                             &flags,
@@ -762,7 +773,7 @@ pub const IO = struct {
             .{
                 .fd = fd,
                 .buf = buffer.ptr,
-                .len = @intCast(u32, buffer_limit(buffer.len)),
+                .len = @as(u32, @intCast(buffer_limit(buffer.len))),
                 .offset = offset,
             },
             struct {
@@ -774,6 +785,7 @@ pub const IO = struct {
                         error.BrokenPipe => unreachable,
                         error.ConnectionTimedOut => unreachable,
                         error.AccessDenied => error.InputOutput,
+                        error.NetNameDeleted => unreachable,
                         else => |e| e,
                     };
                 }
@@ -805,7 +817,7 @@ pub const IO = struct {
             .{
                 .fd = fd,
                 .buf = buffer.ptr,
-                .len = @intCast(u32, buffer_limit(buffer.len)),
+                .len = @as(u32, @intCast(buffer_limit(buffer.len))),
                 .offset = offset,
             },
             struct {
@@ -842,7 +854,7 @@ pub const IO = struct {
 
                     // Check if the fd is a SOCKET by seeing if getsockopt() returns ENOTSOCK
                     // https://stackoverflow.com/a/50981652
-                    const socket = @ptrCast(os.socket_t, op.fd);
+                    const socket: os.socket_t = @ptrCast(op.fd);
                     getsockoptError(socket) catch |err| switch (err) {
                         error.FileDescriptorNotASocket => return os.windows.CloseHandle(op.fd),
                         else => {},
@@ -868,6 +880,24 @@ pub const IO = struct {
         completion: *Completion,
         nanoseconds: u63,
     ) void {
+        // Special case a zero timeout as a yield.
+        if (nanoseconds == 0) {
+            completion.* = .{
+                .next = null,
+                .context = @ptrCast(context),
+                .operation = undefined,
+                .callback = struct {
+                    fn on_complete(ctx: Completion.Context) void {
+                        const _context: Context = @ptrCast(@alignCast(ctx.completion.context));
+                        callback(_context, ctx.completion, {});
+                    }
+                }.on_complete,
+            };
+
+            self.completed.push(completion);
+            return;
+        }
+
         self.submit(
             context,
             callback,
@@ -894,9 +924,9 @@ pub const IO = struct {
         flags |= os.windows.ws2_32.WSA_FLAG_NO_HANDLE_INHERIT;
 
         const socket = try os.windows.WSASocketW(
-            @bitCast(i32, family),
-            @bitCast(i32, sock_type),
-            @bitCast(i32, protocol),
+            @as(i32, @bitCast(family)),
+            @as(i32, @bitCast(sock_type)),
+            @as(i32, @bitCast(protocol)),
             null,
             0,
             flags,
@@ -912,7 +942,7 @@ pub const IO = struct {
         mode |= os.windows.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
         mode |= os.windows.FILE_SKIP_SET_EVENT_ON_HANDLE;
 
-        const handle = @ptrCast(os.windows.HANDLE, socket);
+        const handle = @as(os.windows.HANDLE, @ptrCast(socket));
         try os.windows.SetFileCompletionNotificationModes(handle, mode);
 
         return socket;
@@ -926,34 +956,20 @@ pub const IO = struct {
 
     pub const INVALID_FILE = os.windows.INVALID_HANDLE_VALUE;
 
-    /// Opens or creates a journal file:
-    /// - For reading and writing.
-    /// - For Direct I/O (required on windows).
-    /// - Obtains an advisory exclusive lock to the file descriptor.
-    /// - Allocates the file contiguously on disk if this is supported by the file system.
-    /// - Ensures that the file data is durable on disk.
-    ///   The caller is responsible for ensuring that the parent directory inode is durable.
-    /// - Verifies that the file size matches the expected file size before returning.
-    pub fn open_file(
-        dir_handle: os.fd_t,
-        relative_path: []const u8,
-        size: u64,
-        must_create: bool,
-    ) !os.fd_t {
-        assert(relative_path.len > 0);
-        assert(size >= constants.sector_size);
-        assert(size % constants.sector_size == 0);
-
+    fn open_file_handle(relative_path: []const u8, method: enum { create, open }) !os.fd_t {
         const path_w = try os.windows.sliceToPrefixedFileW(relative_path);
 
         // FILE_CREATE = O_CREAT | O_EXCL
         var creation_disposition: os.windows.DWORD = 0;
-        if (must_create) {
-            log.info("creating \"{s}\"...", .{relative_path});
-            creation_disposition = os.windows.FILE_CREATE;
-        } else {
-            log.info("opening \"{s}\"...", .{relative_path});
-            creation_disposition = os.windows.OPEN_EXISTING;
+        switch (method) {
+            .create => {
+                creation_disposition = os.windows.FILE_CREATE;
+                log.info("creating \"{s}\"...", .{relative_path});
+            },
+            .open => {
+                creation_disposition = os.windows.OPEN_EXISTING;
+                log.info("opening \"{s}\"...", .{relative_path});
+            },
         }
 
         // O_EXCL
@@ -997,6 +1013,34 @@ pub const IO = struct {
             };
         }
 
+        return handle;
+    }
+
+    /// Opens or creates a journal file:
+    /// - For reading and writing.
+    /// - For Direct I/O (required on windows).
+    /// - Obtains an advisory exclusive lock to the file descriptor.
+    /// - Allocates the file contiguously on disk if this is supported by the file system.
+    /// - Ensures that the file data is durable on disk.
+    ///   The caller is responsible for ensuring that the parent directory inode is durable.
+    /// - Verifies that the file size matches the expected file size before returning.
+    pub fn open_file(
+        dir_handle: os.fd_t,
+        relative_path: []const u8,
+        size: u64,
+        method: enum { create, create_or_open, open },
+    ) !os.fd_t {
+        assert(relative_path.len > 0);
+        assert(size % constants.sector_size == 0);
+
+        const handle = switch (method) {
+            .open => try open_file_handle(relative_path, .open),
+            .create => try open_file_handle(relative_path, .create),
+            .create_or_open => open_file_handle(relative_path, .open) catch |err| switch (err) {
+                error.FileNotFound => try open_file_handle(relative_path, .create),
+                else => return err,
+            },
+        };
         errdefer os.windows.CloseHandle(handle);
 
         // Obtain an advisory exclusive lock
@@ -1007,7 +1051,7 @@ pub const IO = struct {
         };
 
         // Ask the file system to allocate contiguous sectors for the file (if possible):
-        if (must_create) {
+        if (method == .create) {
             log.info("allocating {}...", .{std.fmt.fmtIntSizeBin(size)});
             fs_allocate(handle, size) catch {
                 log.warn("file system failed to preallocate the file memory", .{});
@@ -1049,7 +1093,7 @@ pub const IO = struct {
 
         const kernel32 = struct {
             const LOCKFILE_EXCLUSIVE_LOCK = 0x2;
-            const LOCKFILE_FAIL_IMMEDIATELY = 01;
+            const LOCKFILE_FAIL_IMMEDIATELY = 0x1;
 
             extern "kernel32" fn LockFileEx(
                 hFile: os.windows.HANDLE,
@@ -1074,8 +1118,8 @@ pub const IO = struct {
             handle,
             lock_flags,
             0, // reserved param is always zero
-            @truncate(u32, size), // low bits of size
-            @truncate(u32, size >> 32), // high bits of size
+            @as(u32, @truncate(size)), // low bits of size
+            @as(u32, @truncate(size >> 32)), // high bits of size
             &lock_overlapped,
         );
 
@@ -1094,7 +1138,7 @@ pub const IO = struct {
         // Move the file pointer to the start + size
         const seeked = os.windows.kernel32.SetFilePointerEx(
             handle,
-            @intCast(i64, size),
+            @as(i64, @intCast(size)),
             null, // no reference to new file pointer
             os.windows.FILE_BEGIN,
         );
@@ -1144,7 +1188,7 @@ fn getsockoptError(socket: os.socket_t) IO.ConnectError!void {
     if (err_code == 0)
         return;
 
-    const ws_err = @intToEnum(os.windows.ws2_32.WinsockError, @intCast(u16, err_code));
+    const ws_err = @as(os.windows.ws2_32.WinsockError, @enumFromInt(@as(u16, @intCast(err_code))));
     return switch (ws_err) {
         .WSAEACCES => error.PermissionDenied,
         .WSAEADDRINUSE => error.AddressInUse,

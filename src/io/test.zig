@@ -102,7 +102,7 @@ test "accept/connect/send/receive" {
             var io = try IO.init(32, 0);
             defer io.deinit();
 
-            const address = try std.net.Address.parseIp4("127.0.0.1", 3131);
+            const address = try std.net.Address.parseIp4("127.0.0.1", 0);
             const kernel_backlog = 1;
             const server = try io.open_socket(address.any.family, os.SOCK.STREAM, os.IPPROTO.TCP);
             defer os.closeSocket(server);
@@ -119,6 +119,10 @@ test "accept/connect/send/receive" {
             try os.bind(server, &address.any, address.getOsSockLen());
             try os.listen(server, kernel_backlog);
 
+            var client_address = std.net.Address.initIp4(undefined, undefined);
+            var client_address_len = client_address.getOsSockLen();
+            try os.getsockname(server, &client_address.any, &client_address_len);
+
             var self: Context = .{
                 .io = &io,
                 .server = server,
@@ -132,7 +136,7 @@ test "accept/connect/send/receive" {
                 connect_callback,
                 &client_completion,
                 client,
-                address,
+                client_address,
             );
 
             var server_completion: IO.Completion = undefined;
@@ -225,7 +229,7 @@ test "timeout" {
             defer self.io.deinit();
 
             var completions: [count]IO.Completion = undefined;
-            for (completions) |*completion| {
+            for (&completions) |*completion| {
                 self.io.timeout(
                     *Context,
                     &self,
@@ -241,7 +245,7 @@ test "timeout" {
 
             try testing.expectApproxEqAbs(
                 @as(f64, ms),
-                @intToFloat(f64, (self.stop_time - start_time) / std.time.ns_per_ms),
+                @as(f64, @floatFromInt((self.stop_time - start_time) / std.time.ns_per_ms)),
                 margin,
             );
         }
@@ -275,7 +279,7 @@ test "submission queue full" {
             defer self.io.deinit();
 
             var completions: [count]IO.Completion = undefined;
-            for (completions) |*completion| {
+            for (&completions) |*completion| {
                 self.io.timeout(
                     *Context,
                     &self,
@@ -318,7 +322,7 @@ test "tick to wait" {
             var self: Context = .{ .io = try IO.init(1, 0) };
             defer self.io.deinit();
 
-            const address = try std.net.Address.parseIp4("127.0.0.1", 3131);
+            const address = try std.net.Address.parseIp4("127.0.0.1", 0);
             const kernel_backlog = 1;
 
             const server = try self.io.open_socket(address.any.family, os.SOCK.STREAM, os.IPPROTO.TCP);
@@ -333,7 +337,11 @@ test "tick to wait" {
             try os.bind(server, &address.any, address.getOsSockLen());
             try os.listen(server, kernel_backlog);
 
-            const client = try self.io.open_socket(address.any.family, os.SOCK.STREAM, os.IPPROTO.TCP);
+            var client_address = std.net.Address.initIp4(undefined, undefined);
+            var client_address_len = client_address.getOsSockLen();
+            try os.getsockname(server, &client_address.any, &client_address_len);
+
+            const client = try self.io.open_socket(client_address.any.family, os.SOCK.STREAM, os.IPPROTO.TCP);
             defer os.closeSocket(client);
 
             // Start the accept
@@ -348,7 +356,7 @@ test "tick to wait" {
                 connect_callback,
                 &client_completion,
                 client,
-                address,
+                client_address,
             );
 
             // Tick the IO to drain the accept & connect completions
@@ -365,7 +373,7 @@ test "tick to wait" {
             // Start receiving on the client
             var recv_completion: IO.Completion = undefined;
             var recv_buffer: [64]u8 = undefined;
-            std.mem.set(u8, &recv_buffer, 0xaa);
+            @memset(&recv_buffer, 0xaa);
             self.io.recv(
                 *Context,
                 &self,
@@ -465,7 +473,7 @@ test "tick to wait" {
                     else => |err| return os.windows.unexpectedWSAError(err),
                 }
             } else {
-                return @intCast(usize, rc);
+                return @as(usize, @intCast(rc));
             }
         }
     }.run_test();
@@ -497,8 +505,8 @@ test "pipe data over socket" {
             const rx_buf = try testing.allocator.alloc(u8, buffer_size);
             defer testing.allocator.free(rx_buf);
 
-            std.mem.set(u8, tx_buf, 1);
-            std.mem.set(u8, rx_buf, 0);
+            @memset(tx_buf, 1);
+            @memset(rx_buf, 0);
             var self = Context{
                 .io = try IO.init(32, 0),
                 .tx = .{ .buffer = tx_buf },
@@ -509,7 +517,7 @@ test "pipe data over socket" {
             self.server.fd = try self.io.open_socket(os.AF.INET, os.SOCK.STREAM, os.IPPROTO.TCP);
             defer os.closeSocket(self.server.fd);
 
-            const address = try std.net.Address.parseIp4("127.0.0.1", 3131);
+            const address = try std.net.Address.parseIp4("127.0.0.1", 0);
             try os.setsockopt(
                 self.server.fd,
                 os.SOL.SOCKET,
@@ -519,6 +527,10 @@ test "pipe data over socket" {
 
             try os.bind(self.server.fd, &address.any, address.getOsSockLen());
             try os.listen(self.server.fd, 1);
+
+            var client_address = std.net.Address.initIp4(undefined, undefined);
+            var client_address_len = client_address.getOsSockLen();
+            try os.getsockname(self.server.fd, &client_address.any, &client_address_len);
 
             self.io.accept(
                 *Context,
@@ -537,14 +549,14 @@ test "pipe data over socket" {
                 on_connect,
                 &self.tx.socket.completion,
                 self.tx.socket.fd,
-                address,
+                client_address,
             );
 
             var tick: usize = 0xdeadbeef;
             while (self.rx.transferred != self.rx.buffer.len) : (tick +%= 1) {
                 if (tick % 61 == 0) {
                     const timeout_ns = tick % (10 * std.time.ns_per_ms);
-                    try self.io.run_for_ns(@intCast(u63, timeout_ns));
+                    try self.io.run_for_ns(@as(u63, @intCast(timeout_ns)));
                 } else {
                     try self.io.tick();
                 }
@@ -578,7 +590,6 @@ test "pipe data over socket" {
             completion: *IO.Completion,
             result: IO.ConnectError!void,
         ) void {
-            _ = completion;
             _ = result catch unreachable;
 
             assert(self.tx.socket.fd != IO.INVALID_SOCKET);

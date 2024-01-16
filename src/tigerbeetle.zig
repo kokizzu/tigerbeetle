@@ -2,39 +2,44 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 
+const stdx = @import("stdx.zig");
+
 pub const Account = extern struct {
     id: u128,
-    /// Opaque third-party identifier to link this account (many-to-one) to an external entity.
-    user_data: u128,
+    debits_pending: u128,
+    debits_posted: u128,
+    credits_pending: u128,
+    credits_posted: u128,
+    /// Opaque third-party identifiers to link this account (many-to-one) to external entities.
+    user_data_128: u128,
+    user_data_64: u64,
+    user_data_32: u32,
     /// Reserved for accounting policy primitives.
-    reserved: [48]u8,
+    reserved: u32,
     ledger: u32,
     /// A chart of accounts code describing the type of account (e.g. clearing, settlement).
     code: u16,
     flags: AccountFlags,
-    debits_pending: u64,
-    debits_posted: u64,
-    credits_pending: u64,
-    credits_posted: u64,
     timestamp: u64 = 0,
 
     comptime {
+        assert(stdx.no_padding(Account));
         assert(@sizeOf(Account) == 128);
-        assert(@bitSizeOf(Account) == @sizeOf(Account) * 8);
+        assert(@alignOf(Account) == 16);
     }
 
-    pub fn debits_exceed_credits(self: *const Account, amount: u64) bool {
+    pub fn debits_exceed_credits(self: *const Account, amount: u128) bool {
         return (self.flags.debits_must_not_exceed_credits and
             self.debits_pending + self.debits_posted + amount > self.credits_posted);
     }
 
-    pub fn credits_exceed_debits(self: *const Account, amount: u64) bool {
+    pub fn credits_exceed_debits(self: *const Account, amount: u128) bool {
         return (self.flags.credits_must_not_exceed_debits and
             self.credits_pending + self.credits_posted + amount > self.debits_posted);
     }
 };
 
-pub const AccountFlags = packed struct {
+pub const AccountFlags = packed struct(u16) {
     /// When the .linked flag is specified, it links an event with the next event in the batch, to
     /// create a chain of events, of arbitrary length, which all succeed or fail together. The tail
     /// of a chain is denoted by the first event without this flag. The last event in a batch may
@@ -52,6 +57,7 @@ pub const AccountFlags = packed struct {
 
     comptime {
         assert(@sizeOf(AccountFlags) == @sizeOf(u16));
+        assert(@bitSizeOf(AccountFlags) == @sizeOf(AccountFlags) * 8);
     }
 };
 
@@ -59,136 +65,167 @@ pub const Transfer = extern struct {
     id: u128,
     debit_account_id: u128,
     credit_account_id: u128,
-    /// Opaque third-party identifier to link this transfer (many-to-one) to an external entity.
-    user_data: u128,
-    /// Reserved for accounting policy primitives.
-    reserved: u128,
+    amount: u128,
     /// If this transfer will post or void a pending transfer, the id of that pending transfer.
     pending_id: u128,
-    timeout: u64,
+    /// Opaque third-party identifiers to link this transfer (many-to-one) to an external entities.
+    user_data_128: u128,
+    user_data_64: u64,
+    user_data_32: u32,
+    /// Timeout in seconds for pending transfers to expire automatically
+    /// if not manually posted or voided.
+    timeout: u32,
     ledger: u32,
     /// A chart of accounts code describing the reason for the transfer (e.g. deposit, settlement).
     code: u16,
     flags: TransferFlags,
-    amount: u64,
     timestamp: u64 = 0,
 
     comptime {
+        assert(stdx.no_padding(Transfer));
         assert(@sizeOf(Transfer) == 128);
-        assert(@bitSizeOf(Transfer) == @sizeOf(Transfer) * 8);
+        assert(@alignOf(Transfer) == 16);
     }
 };
 
-pub const TransferFlags = packed struct {
+pub const TransferFlags = packed struct(u16) {
     linked: bool = false,
     pending: bool = false,
     post_pending_transfer: bool = false,
     void_pending_transfer: bool = false,
-    padding: u12 = 0,
+    balancing_debit: bool = false,
+    balancing_credit: bool = false,
+    padding: u10 = 0,
 
     comptime {
         assert(@sizeOf(TransferFlags) == @sizeOf(u16));
+        assert(@bitSizeOf(TransferFlags) == @sizeOf(TransferFlags) * 8);
     }
 };
 
+/// Error codes are ordered by descending precedence.
+/// When errors do not have an obvious/natural precedence (e.g. "*_must_be_zero"),
+/// the ordering matches struct field order.
 pub const CreateAccountResult = enum(u32) {
-    ok,
-    linked_event_failed,
-    linked_event_chain_open,
+    ok = 0,
+    linked_event_failed = 1,
+    linked_event_chain_open = 2,
+    timestamp_must_be_zero = 3,
 
-    reserved_flag,
-    reserved_field,
+    reserved_field = 4,
+    reserved_flag = 5,
 
-    id_must_not_be_zero,
-    id_must_not_be_int_max,
-    ledger_must_not_be_zero,
-    code_must_not_be_zero,
-    debits_pending_must_be_zero,
-    debits_posted_must_be_zero,
-    credits_pending_must_be_zero,
-    credits_posted_must_be_zero,
+    id_must_not_be_zero = 6,
+    id_must_not_be_int_max = 7,
 
-    mutually_exclusive_flags,
+    flags_are_mutually_exclusive = 8,
 
-    exists_with_different_flags,
-    exists_with_different_user_data,
-    exists_with_different_ledger,
-    exists_with_different_code,
-    exists,
+    debits_pending_must_be_zero = 9,
+    debits_posted_must_be_zero = 10,
+    credits_pending_must_be_zero = 11,
+    credits_posted_must_be_zero = 12,
+    ledger_must_not_be_zero = 13,
+    code_must_not_be_zero = 14,
+
+    exists_with_different_flags = 15,
+
+    exists_with_different_user_data_128 = 16,
+    exists_with_different_user_data_64 = 17,
+    exists_with_different_user_data_32 = 18,
+    exists_with_different_ledger = 19,
+    exists_with_different_code = 20,
+    exists = 21,
+
+    comptime {
+        for (std.enums.values(CreateAccountResult), 0..) |result, index| {
+            assert(@intFromEnum(result) == index);
+        }
+    }
 };
 
+/// Error codes are ordered by descending precedence.
+/// When errors do not have an obvious/natural precedence (e.g. "*_must_not_be_zero"),
+/// the ordering matches struct field order.
 pub const CreateTransferResult = enum(u32) {
-    ok,
-    linked_event_failed,
-    linked_event_chain_open,
+    ok = 0,
+    linked_event_failed = 1,
+    linked_event_chain_open = 2,
+    timestamp_must_be_zero = 3,
 
-    reserved_flag,
-    reserved_field,
+    reserved_flag = 4,
 
-    id_must_not_be_zero,
-    id_must_not_be_int_max,
-    debit_account_id_must_not_be_zero,
-    debit_account_id_must_not_be_int_max,
-    credit_account_id_must_not_be_zero,
-    credit_account_id_must_not_be_int_max,
-    accounts_must_be_different,
+    id_must_not_be_zero = 5,
+    id_must_not_be_int_max = 6,
 
-    pending_id_must_be_zero,
+    flags_are_mutually_exclusive = 7,
 
-    ledger_must_not_be_zero,
-    code_must_not_be_zero,
-    amount_must_not_be_zero,
+    debit_account_id_must_not_be_zero = 8,
+    debit_account_id_must_not_be_int_max = 9,
+    credit_account_id_must_not_be_zero = 10,
+    credit_account_id_must_not_be_int_max = 11,
+    accounts_must_be_different = 12,
 
-    debit_account_not_found,
-    credit_account_not_found,
+    pending_id_must_be_zero = 13,
+    pending_id_must_not_be_zero = 14,
+    pending_id_must_not_be_int_max = 15,
+    pending_id_must_be_different = 16,
+    timeout_reserved_for_pending_transfer = 17,
 
-    accounts_must_have_the_same_ledger,
-    transfer_must_have_the_same_ledger_as_accounts,
+    amount_must_not_be_zero = 18,
+    ledger_must_not_be_zero = 19,
+    code_must_not_be_zero = 20,
 
-    exists_with_different_flags,
-    exists_with_different_debit_account_id,
-    exists_with_different_credit_account_id,
-    exists_with_different_user_data,
-    exists_with_different_pending_id,
-    exists_with_different_timeout,
-    exists_with_different_code,
-    exists_with_different_amount,
-    exists,
+    debit_account_not_found = 21,
+    credit_account_not_found = 22,
 
-    overflows_debits_pending,
-    overflows_credits_pending,
-    overflows_debits_posted,
-    overflows_credits_posted,
-    overflows_debits,
-    overflows_credits,
-    overflows_timeout,
+    accounts_must_have_the_same_ledger = 23,
+    transfer_must_have_the_same_ledger_as_accounts = 24,
 
-    exceeds_credits,
-    exceeds_debits,
+    pending_transfer_not_found = 25,
+    pending_transfer_not_pending = 26,
 
-    cannot_post_and_void_pending_transfer,
-    pending_transfer_cannot_post_or_void_another,
-    timeout_reserved_for_pending_transfer,
+    pending_transfer_has_different_debit_account_id = 27,
+    pending_transfer_has_different_credit_account_id = 28,
+    pending_transfer_has_different_ledger = 29,
+    pending_transfer_has_different_code = 30,
 
-    pending_id_must_not_be_zero,
-    pending_id_must_not_be_int_max,
-    pending_id_must_be_different,
+    exceeds_pending_transfer_amount = 31,
+    pending_transfer_has_different_amount = 32,
 
-    pending_transfer_not_found,
-    pending_transfer_not_pending,
+    pending_transfer_already_posted = 33,
+    pending_transfer_already_voided = 34,
 
-    pending_transfer_has_different_debit_account_id,
-    pending_transfer_has_different_credit_account_id,
-    pending_transfer_has_different_ledger,
-    pending_transfer_has_different_code,
+    pending_transfer_expired = 35,
 
-    exceeds_pending_transfer_amount,
-    pending_transfer_has_different_amount,
+    exists_with_different_flags = 36,
 
-    pending_transfer_already_posted,
-    pending_transfer_already_voided,
+    exists_with_different_debit_account_id = 37,
+    exists_with_different_credit_account_id = 38,
+    exists_with_different_amount = 39,
+    exists_with_different_pending_id = 40,
+    exists_with_different_user_data_128 = 41,
+    exists_with_different_user_data_64 = 42,
+    exists_with_different_user_data_32 = 43,
+    exists_with_different_timeout = 44,
+    exists_with_different_code = 45,
+    exists = 46,
 
-    pending_transfer_expired,
+    overflows_debits_pending = 47,
+    overflows_credits_pending = 48,
+    overflows_debits_posted = 49,
+    overflows_credits_posted = 50,
+    overflows_debits = 51,
+    overflows_credits = 52,
+    overflows_timeout = 53,
+
+    exceeds_credits = 54,
+    exceeds_debits = 55,
+
+    comptime {
+        for (std.enums.values(CreateTransferResult), 0..) |result, index| {
+            assert(@intFromEnum(result) == index);
+        }
+    }
 };
 
 pub const CreateAccountsResult = extern struct {
@@ -197,7 +234,7 @@ pub const CreateAccountsResult = extern struct {
 
     comptime {
         assert(@sizeOf(CreateAccountsResult) == 8);
-        assert(@bitSizeOf(CreateAccountsResult) == @sizeOf(CreateAccountsResult) * 8);
+        assert(stdx.no_padding(CreateAccountsResult));
     }
 };
 
@@ -207,7 +244,42 @@ pub const CreateTransfersResult = extern struct {
 
     comptime {
         assert(@sizeOf(CreateTransfersResult) == 8);
-        assert(@bitSizeOf(CreateTransfersResult) == @sizeOf(CreateTransfersResult) * 8);
+        assert(stdx.no_padding(CreateTransfersResult));
+    }
+};
+
+pub const GetAccountTransfers = extern struct {
+    /// The account id.
+    account_id: u128,
+
+    /// Use this field for pagination, transfers will be returned from this timestamp
+    /// depending on the sort order.
+    timestamp: u64,
+
+    /// Maximum number of transfers that can be returned by this query.
+    limit: u32,
+
+    /// Query flags.
+    flags: GetAccountTransfersFlags,
+
+    comptime {
+        assert(@sizeOf(GetAccountTransfers) == 32);
+        assert(stdx.no_padding(GetAccountTransfers));
+    }
+};
+
+pub const GetAccountTransfersFlags = packed struct(u32) {
+    /// Whether to include debit transfers where `debit_account_id` matches.
+    debits: bool,
+    /// Whether to include credit transfers where `credit_account_id` matches.
+    credits: bool,
+    /// Whether the results are sorted by timestamp in chronological or reverse-chronological order.
+    reversed: bool,
+    padding: u29 = 0,
+
+    comptime {
+        assert(@sizeOf(GetAccountTransfersFlags) == @sizeOf(u32));
+        assert(@bitSizeOf(GetAccountTransfersFlags) == @sizeOf(GetAccountTransfersFlags) * 8);
     }
 };
 
@@ -221,5 +293,10 @@ comptime {
     // We require little-endian architectures everywhere for efficient network deserialization:
     if (target.cpu.arch.endian() != .Little) {
         @compileError("big-endian systems not supported");
+    }
+
+    switch (builtin.mode) {
+        .Debug, .ReleaseSafe => {},
+        .ReleaseFast, .ReleaseSmall => @compileError("safety checks are required for correctness"),
     }
 }
